@@ -82,17 +82,29 @@ async def handle_ad_completed(request):
         logger.error(f"API Error: {e}")
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
+async def handle_telegram_webhook(request):
+    """Processes incoming Telegram updates via webhook."""
+    try:
+        data = await request.json()
+        update = Update.de_json(data, application.bot)
+        await application.update_queue.put(update)
+        return web.Response(text="OK")
+    except Exception as e:
+        logger.error(f"Error handling Telegram webhook: {e}")
+        return web.Response(status=500, text="Internal Error")
+
 async def start_web_server():
     app = web.Application()
     app.add_routes([
         web.get('/', handle_index),
         web.post('/ad-completed', handle_ad_completed),
+        web.post(f'/{TELEGRAM_BOT_TOKEN}', handle_telegram_webhook),
     ])
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    logger.info(f"🚀 Web server started on port {PORT}")
+    logger.info(f"🚀 Combined Web server + Webhook started on port {PORT}")
 
 # ==========================================
 # MAIN ENTRY POINT
@@ -190,12 +202,10 @@ async def main():
         if RENDER_EXTERNAL_URL:
             # Render Webhook Mode
             logger.info(f"🌐 Cloud environment detected! Starting Webhook at {RENDER_EXTERNAL_URL}")
-            await application.updater.start_webhook(
-                listen="0.0.0.0",
-                port=PORT,
-                url_path=TELEGRAM_BOT_TOKEN,
-                webhook_url=f"{RENDER_EXTERNAL_URL}/{TELEGRAM_BOT_TOKEN}"
-            )
+            await start_web_server()
+            webhook_url = f"{RENDER_EXTERNAL_URL}/{TELEGRAM_BOT_TOKEN}"
+            await application.bot.set_webhook(url=webhook_url)
+            logger.info(f"✅ Telegram Webhook set to {webhook_url}")
         else:
             # Local Polling Mode
             logger.info("🤖 Local environment detected! Starting Polling...")
