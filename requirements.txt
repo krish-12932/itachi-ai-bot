@@ -1,0 +1,7 @@
+python-telegram-bot
+supabase
+python-dotenv
+aiohttp
+shortuuid
+ motor
+ pymongo
