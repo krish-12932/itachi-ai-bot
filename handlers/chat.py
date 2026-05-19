@@ -161,7 +161,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     
     # Use a primary and fallback model
-    models = ["gemini-flash-latest"]
+    models = ["gemini-1.5-flash","gemini-flash-latest"]
     
     # Structure contents for Gemini (History only)
     contents = []
@@ -527,7 +527,7 @@ async def handle_guest_message(guest_msg: dict, context):
     if db_user.get("personality_summary"):
         system_prompt += f"\n\nHistorical Context: {db_user.get('personality_summary')}"
         
-    models = ["gemini-flash-latest"]
+    models = ["gemini-1.5-flash","gemini-flash-latest"]
     contents = []
     history = get_recent_messages(user_id, limit=6)
     for msg in reversed(history):
@@ -595,7 +595,7 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
     full_response = ""
     system_prompt = ITACHI_PERSONA_PROMPT + "\n\n[BUSINESS ASSISTANT MODE]: You are replying on behalf of a user's personal Telegram account. Maintain your Itachi persona, but act as their personal assistant. Reply directly to the user who messaged them."
     
-    models = ["gemini-2.0-flash", "gemini-flash-latest"]
+    models = ["gemini-1.5-flash", "gemini-flash-latest"]
     contents = [{"role": "user", "parts": [{"text": user_message}]}]
     
     last_update_time = 0
