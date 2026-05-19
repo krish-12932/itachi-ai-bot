@@ -19,7 +19,15 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # Web Server Config
 PORT = int(os.getenv("PORT", 8080))
-WEB_DOMAIN = os.getenv("WEB_DOMAIN", "https://your-deployed-domain.com")
+web_domain_env = os.getenv("WEB_DOMAIN", "")
+render_url_env = os.getenv("RENDER_EXTERNAL_URL", "")
+
+if web_domain_env and "your-app-name" not in web_domain_env and "your-deployed-domain" not in web_domain_env:
+    WEB_DOMAIN = web_domain_env.rstrip("/")
+elif render_url_env:
+    WEB_DOMAIN = render_url_env.rstrip("/")
+else:
+    WEB_DOMAIN = f"http://localhost:{PORT}"
 
 # Dynamic Channel Config
 FORCE_JOIN_CHANNELS = []
