@@ -1,223 +1,642 @@
-import os
+import aiohttp
+import json
 import asyncio
-import logging
-import shortuuid
-from aiohttp import web
-from telegram import Update, BotCommand, BotCommandScopeChat
-from telegram.ext import CommandHandler, MessageHandler, CallbackQueryHandler, ChatMemberHandler, TypeHandler, filters
+import time
+import base64
+import re
+from telegram import Update
+from telegram.ext import ContextTypes
+from config import GOOGLE_API_KEY, ADMIN_IDS, TELEGRAM_BOT_TOKEN
+from database.models import (
+    get_user, set_chat_mode, update_user_coins, 
+    increment_message_count, update_personality, 
+    save_message, get_recent_messages, ban_user
+)
+from datetime import datetime
+from prompts.itachi_prompts import ITACHI_PERSONA_PROMPT
+from utils.messages import CHAT_STARTED_MSG, CHAT_ENDED_MSG, INSUFFICIENT_COINS_MSG, FORCE_JOIN_MSG
+from keyboards.inline import get_join_keyboard
+from handlers.start import check_force_join
 
-from config import PORT, TELEGRAM_BOT_TOKEN, ADMIN_IDS
-from bot import application, bot
-from database.models import get_ad_session, delete_ad_session, update_user_coins, set_unlimited_chat
+# Auto-Moderation: Bad words list
+BAD_WORDS = ["chutiya", "bhosdi", "madarchod", "mc", "bc", "behenchod", "fuck", "bitch", "asshole", "kutta", "kamina", "randi", "gandu", "laude", "lodu"] # Added common bad words
 
-# Import handlers (to be created)
-from handlers.start import start_handler, check_join_callback, chat_member_updated
-from handlers.chat import chat_handler, endchat_handler, message_handler, photo_handler
-from handlers.profile import profile_handler
-from handlers.plan import plan_handler
-from handlers.referral import referral_handler
-from handlers.support import support_handler
-from handlers.admin import broadcast_handler, reply_handler, ban_command_handler, unban_command_handler, give_coins_handler
-from utils.scheduler import setup_scheduler
-from handlers.rewards import daily_handler, leaderboard_handler
-from handlers.game import game_handler
+async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    # Force Join Check
+    if not await check_force_join(update, context):
+        await update.message.reply_text(
+            FORCE_JOIN_MSG, 
+            reply_markup=get_join_keyboard(),
+            parse_mode="HTML"
+        )
+        return
 
-logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
+    set_chat_mode(user_id, True)
+    await update.message.reply_text(CHAT_STARTED_MSG, parse_mode="Markdown")
 
-# ==========================================
-# WEB SERVER LOGIC
-# ==========================================
+async def endchat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    set_chat_mode(user_id, False)
+    await update.message.reply_text(CHAT_ENDED_MSG, parse_mode="Markdown")
 
-async def handle_index(request):
-    """Serves the frontend web application (index.html)"""
-    return web.FileResponse('index.html')
-
-async def handle_ad_completed(request):
-    """API endpoint called by the web app when an ad finishes."""
-    try:
-        data = await request.json()
-        code = data.get("code")
-
-        if not code:
-            return web.json_response({"status": "error", "message": "Missing code"}, status=400)
-
-        session = get_ad_session(code)
-        if not session:
-            return web.json_response({"status": "error", "message": "Invalid or expired code"}, status=400)
-
-        user_id = session["user_id"]
-        message_id = session["message_id"]
-        session_type = session["type"]
-
-        # Reward the user
-        if session_type == "10_coins":
-            new_coins = update_user_coins(user_id, 10)
-            reward_text = f"🎉 *Reward Unlocked!*\n\n✅ 10 Coins have been added to your balance.\n💰 **New Balance:** {new_coins}"
-        elif session_type == "unlimited":
-            # For now, let's say 1 ad gives unlimited chat (as per user's 10 ads watch, we can track progress)
-            # Simplification: If they watch the 'unlimited' ad type, they get it.
-            # Realistically, you might want to track ad count.
-            set_unlimited_chat(user_id, True)
-            reward_text = "🎉 *Reward Unlocked!*\n\n✅ You now have **Unlimited Chat** mode!"
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import logging
+    logging.info(f"Received message_handler update: {update.message.text if update.message else 'No message'}")
+    
+    if not update.effective_user:
+        logging.warning("No effective user in update")
+        return
         
-        # Delete session
-        delete_ad_session(code)
+    user_id = update.effective_user.id
+    
+    # Force Join Check
+    if not await check_force_join(update, context):
+        await update.message.reply_text(
+            FORCE_JOIN_MSG, 
+            reply_markup=get_join_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+        
+    db_user = get_user(user_id)
+    if not db_user:
+        # Auto-register user if they interact in a group for the first time
+        from database.models import add_user
+        db_user = add_user(user_id, update.effective_user.first_name, update.effective_user.username)
+        if not db_user: return
 
-        # Notify user on Telegram
-        try:
-            await bot.edit_message_text(
-                chat_id=user_id,
-                message_id=message_id,
-                text=reward_text,
-                parse_mode="Markdown"
+    # 1. Global Ban Check
+    from datetime import datetime, timezone
+    ban_until = db_user.get("ban_until")
+    if ban_until:
+        ban_until_dt = datetime.fromisoformat(ban_until.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        if now < ban_until_dt:
+            remaining = ban_until_dt - now
+            mins = remaining.seconds // 60
+            secs = remaining.seconds % 60
+            await update.message.reply_text(
+                f"🛑 <b>You are currently BANNED!</b>\n\nReason: Using prohibited words.\nTime remaining: <b>{mins}m {secs}s</b>\n\nIzanami has trapped you. Learn from your mistakes.",
+                parse_mode="HTML"
             )
-        except Exception as e:
-            logger.error(f"Error editing message: {e}")
-            await bot.send_message(chat_id=user_id, text=reward_text, parse_mode="Markdown")
+            return
 
-        return web.json_response({"status": "success", "message": "Reward Sent!"})
-
-    except Exception as e:
-        logger.error(f"API Error: {e}")
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-async def handle_telegram_webhook(request):
-    """Processes incoming Telegram updates via webhook."""
-    try:
-        data = await request.json()
-        update = Update.de_json(data, application.bot)
-        await application.update_queue.put(update)
-        return web.Response(text="OK")
-    except Exception as e:
-        logger.error(f"Error handling Telegram webhook: {e}")
-        return web.Response(status=500, text="Internal Error")
-
-async def start_web_server():
-    app = web.Application()
-    app.add_routes([
-        web.get('/', handle_index),
-        web.post('/ad-completed', handle_ad_completed),
-        web.post(f'/{TELEGRAM_BOT_TOKEN}', handle_telegram_webhook),
-    ])
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    logger.info(f"🚀 Combined Web server + Webhook started on port {PORT}")
-
-# ==========================================
-# MAIN ENTRY POINT
-# ==========================================
-
-async def raw_update_logger(update: Update, context):
-    logger.info(f"⚡ RAW UPDATE: {update}")
-    api_kwargs = getattr(update, "api_kwargs", {}) or {}
-    guest_msg = api_kwargs.get("guest_message")
-    if guest_msg:
-        logger.info("⚡ Intercepted Guest Message! Dispatching to handler...")
-        from handlers.chat import handle_guest_message
-        asyncio.create_task(handle_guest_message(guest_msg, context))
-
-async def main():
-    # Register raw update logger
-    application.add_handler(TypeHandler(Update, raw_update_logger), group=-1)
+    if not db_user.get("is_chatting") and update.message.chat.type == "private":
+        return
     
-    # Register handlers
-    application.add_handler(CommandHandler("start", start_handler))
-    application.add_handler(CommandHandler("chat", chat_handler))
-    application.add_handler(CommandHandler("endchat", endchat_handler))
-    application.add_handler(CommandHandler("profile", profile_handler))
-    application.add_handler(CommandHandler("plan", plan_handler))
-    application.add_handler(CommandHandler("referral", referral_handler))
-    application.add_handler(CommandHandler("support", support_handler))
-    application.add_handler(CommandHandler("broadcast", broadcast_handler))
-    application.add_handler(CommandHandler("reply", reply_handler))
-    application.add_handler(CommandHandler("ban", ban_command_handler))
-    application.add_handler(CommandHandler("unban", unban_command_handler))
-    application.add_handler(CommandHandler("givecoins", give_coins_handler))
-    application.add_handler(CommandHandler("daily", daily_handler))
-    application.add_handler(CommandHandler("top", leaderboard_handler))
-    application.add_handler(CommandHandler("game", game_handler))
-    
-    # Callback query handler for Join Check
-    application.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join$"))
-    
-    # Chat member handler to detect join/leave
-    application.add_handler(ChatMemberHandler(chat_member_updated, ChatMemberHandler.CHAT_MEMBER))
-    
-    # Generic text handler for chat
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-    
-    # Photo handler for image analysis
-    application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-    
-    # Business Message handler (Personal Assistant Mode)
-    from handlers.chat import business_message_handler
-    application.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, business_message_handler))
+    is_admin = str(user_id) in ADMIN_IDS
 
-    # Start bot
-    async with application:
-        await application.start()
-        
-        # Set menu commands
-        commands = [
-            BotCommand("start", "🚀 Start the bot"),
-            BotCommand("chat", "🌑 Start Chatting"),
-            BotCommand("endchat", "🛑 Stop Chatting"),
-            BotCommand("profile", "👤 View Profile"),
-            BotCommand("referral", "🎁 Earn Coins"),
-            BotCommand("daily", "🎁 Claim Daily Coins"),
-            BotCommand("top", "🏆 View Leaderboard"),
-            BotCommand("game", "🎮 Play ninja games"),
-            BotCommand("plan", "💎 Get Unlimited Chat"),
-            BotCommand("support", "📩 Contact Admin"),
-        ]
-        await application.bot.set_my_commands(commands)
-        
-        # Admin commands (For all admins in ADMIN_IDS)
-        if ADMIN_IDS:
-            admin_commands = commands + [
-                BotCommand("broadcast", "📢 Broadcast message to all users"),
-                BotCommand("reply", "📩 Reply to a support ticket"),
-                BotCommand("ban", "🚫 Ban a user"),
-                BotCommand("unban", "✅ Unban a user"),
-                BotCommand("givecoins", "🪙 Give/remove coins from a user")
-            ]
-            for admin_id in ADMIN_IDS:
+    # 2. Auto-Moderation Check (Bad Words) - Skip for Admins
+    if not is_admin:
+        import re
+        user_message = update.message.text
+        if user_message:
+            # Match whole words only to avoid false positives (like "branding" matching "randi", or "mcp" matching "mc")
+            pattern = r'\b(' + '|'.join(map(re.escape, BAD_WORDS)) + r')\b'
+            if re.search(pattern, user_message.lower()):
+                # Calculate Ban: 1 min * (current violations + 1)
+                violations = db_user.get("violation_count", 0) + 1
+                ban_res = ban_user(user_id, violations) # 1 min, 2 min, 3 min...
+                
+                # Notify Admin
+                admin_alert = (
+                    "⚠️ <b>Izanami Alert: User Banned!</b>\n\n"
+                    f"👤 <b>User:</b> {update.effective_user.full_name}\n"
+                    f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
+                    f"🚫 <b>Violation #:</b> {violations}\n"
+                    f"⏳ <b>Ban Duration:</b> {violations} minute(s)\n\n"
+                    f"💬 <b>Message:</b>\n<i>{user_message}</i>"
+                )
                 try:
-                    await application.bot.set_my_commands(
-                        admin_commands, 
-                        scope=BotCommandScopeChat(chat_id=int(admin_id))
-                    )
-                except Exception as e:
-                    logger.error(f"Error setting commands for admin {admin_id}: {e}")
-        
-        # Setup Daily Greetings Scheduler
-        setup_scheduler(application)
-        
-        # Webhook vs Polling logic
-        RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
-        
-        if RENDER_EXTERNAL_URL:
-            # Render Webhook Mode
-            logger.info(f"🌐 Cloud environment detected! Starting Webhook at {RENDER_EXTERNAL_URL}")
-            await start_web_server()
-            webhook_url = f"{RENDER_EXTERNAL_URL}/{TELEGRAM_BOT_TOKEN}"
-            await application.bot.set_webhook(url=webhook_url)
-            logger.info(f"✅ Telegram Webhook set to {webhook_url}")
-        else:
-            # Local Polling Mode
-            logger.info("🤖 Local environment detected! Starting Polling...")
-            await start_web_server() # Start dummy server for local testing if needed
-            await application.updater.start_polling(drop_pending_updates=True)
-            
-        # Keep running
-        while True:
-            await asyncio.sleep(3600)
+                    for admin_id in ADMIN_IDS:
+                        await context.bot.send_message(chat_id=admin_id, text=admin_alert, parse_mode="HTML")
+                except: pass
 
-if __name__ == "__main__":
+                # Reply to User
+                await update.message.reply_text(
+                    f"🌑 <b>Andhera tumhare dimaag par haavi ho raha hai...</b>\n\n"
+                    f"Badtameezi ki wajah se tumhe <b>{violations} minute</b> ke liye ban kiya gaya hai.\n\n"
+                    "Izanami tumhara intezar kar rahi hai. Apne lafzon ka sahi upyog karna seekho.",
+                    parse_mode="HTML"
+                )
+                return
+
+    # Admin Check (Unlimited Chat for Admin)
+
+    # Check coins (unless unlimited or admin)
+    if not is_admin and not db_user.get("unlimited_chat") and db_user.get("coins", 0) <= 0:
+        await update.message.reply_text(INSUFFICIENT_COINS_MSG, parse_mode="Markdown")
+        return
+
+    # Deduct coin (only if not admin)
+    if not is_admin:
+        update_user_coins(user_id, -1)
+    
+    # Increment message count for personality summary
+    count = increment_message_count(user_id)
+    if count > 0 and count % 10 == 0:
+        # Trigger personality summary update
+        await summarize_personality(user_id)
+
+    # Extract and save user message
+    user_message = update.message.text
+    save_message(user_id, "user", user_message)
+
+    # Send typing action
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user.")
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    except Exception:
+        pass
+
+    # Send initial message
+    placeholder_msg = await update.message.reply_text("Replying...")
+    
+    full_response = ""
+    system_prompt = ITACHI_PERSONA_PROMPT
+    if db_user.get("personality_summary"):
+        system_prompt += f"\n\nHistorical Context (Use for tone only): {db_user.get('personality_summary')}"
+        
+    
+    # Use a primary and fallback model
+    models = ["gemini-1.5-flash", "gemini-1.5-flash-latest"]
+    
+    # Structure contents for Gemini (History only)
+    contents = []
+    history = get_recent_messages(user_id, limit=6)
+    for msg in reversed(history):
+        role = "user" if msg['role'] == "user" else "model"
+        contents.append({"role": role, "parts": [{"text": msg['content']}]})
+    
+    # Add current message
+    contents.append({"role": "user", "parts": [{"text": user_message}]})
+    
+    last_update_time = 0
+    last_typing_time = time.time()
+    
+    for model_name in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:streamGenerateContent?alt=sse&key={GOOGLE_API_KEY}"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": contents,
+            "system_instruction": {"parts": [{"text": system_prompt}]}
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=payload) as resp:
+                    if resp.status == 429:
+                        print(f"DEBUG: Model {model_name} rate limited (429). Trying fallback...")
+                        continue
+                    
+                    if resp.status == 503:
+                        await asyncio.sleep(2)
+                        continue
+                    
+                    if resp.status != 200:
+                        continue
+                    
+                    async for line in resp.content:
+                        if not line: continue
+                        line_str = line.decode('utf-8').strip()
+                        if line_str.startswith("data: "):
+                            data_content = line_str[6:]
+                            if data_content == "[DONE]": break
+                            
+                            try:
+                                chunk = json.loads(data_content)
+                                if 'candidates' in chunk:
+                                    content = chunk['candidates'][0]['content']['parts'][0].get('text', '')
+                                    full_response += content
+                                
+                                if time.time() - last_update_time > 0.8 and full_response:
+                                    # Send typing action every 4 seconds to keep the status alive
+                                    if time.time() - last_typing_time > 4.0:
+                                        try:
+                                            await context.bot.send_chat_action(chat_id=user_id, action="typing")
+                                            last_typing_time = time.time()
+                                        except Exception:
+                                            pass
+                                            
+                                    try:
+                                        await context.bot.edit_message_text(
+                                            chat_id=user_id,
+                                            message_id=placeholder_msg.message_id,
+                                            text=full_response + " ▎",
+                                            parse_mode="Markdown"
+                                        )
+                                        last_update_time = time.time()
+                                    except Exception:
+                                        pass # Ignore edit errors during streaming
+                            except Exception:
+                                continue
+
+                    # Final update
+                    await context.bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=placeholder_msg.message_id,
+                        text=full_response or "🌑 Itachi remains silent...",
+                        parse_mode="Markdown"
+                    )
+                    if full_response:
+                        save_message(user_id, "bot", full_response)
+                        return # SUCCESS! Exit the function
+                            
+        except Exception as e:
+            print(f"Error with model {model_name}: {e}")
+            continue # Try next model
+            
+    # If all models fail
+    await context.bot.edit_message_text(
+        chat_id=user_id,
+        message_id=placeholder_msg.message_id,
+        text="🌑 Itachi is meditating... (All models failed. Try again later.)"
+    )
+
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    # Force Join Check
+    if not await check_force_join(update, context):
+        await update.message.reply_text(
+            FORCE_JOIN_MSG, 
+            reply_markup=get_join_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+        
+    db_user = get_user(user_id)
+    
+    if not db_user or not db_user.get("is_chatting"):
+        return
+
+    # Admin Check
+    is_admin = str(user_id) in ADMIN_IDS
+    if not is_admin and not db_user.get("unlimited_chat") and db_user.get("coins", 0) <= 0:
+        await update.message.reply_text(INSUFFICIENT_COINS_MSG, parse_mode="HTML")
+        return
+
+    # Deduct coin
+    if not is_admin:
+        update_user_coins(user_id, -1)
+
+    # Send typing action
+    try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    except Exception:
+        pass
+
+    placeholder_msg = await update.message.reply_text("Analyzing image... 👁️🗨️")
+    
+    # Get the photo
+    photo_file = await update.message.photo[-1].get_file()
+    image_data = await photo_file.download_as_bytearray()
+    base64_image = base64.b64encode(image_data).decode('utf-8')
+    
+    # Prepare prompt
+    user_caption = update.message.caption or "What is in this image? Summarize it."
+    save_message(user_id, "user", f"[Image] {user_caption}")
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GOOGLE_API_KEY}"
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    system_prompt = ITACHI_PERSONA_PROMPT
+    if db_user.get("personality_summary"):
+        system_prompt += f"\n\nAdditional information about this person: {db_user.get('personality_summary')}"
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": f"SYSTEM PROMPT: {system_prompt}\n\nUSER CAPTION: {user_caption}"},
+                    {
+                        "inlineData": {
+                            "mimeType": "image/jpeg",
+                            "data": base64_image
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+
+    placeholder_msg = await update.message.reply_text("Replying...")
+    full_response = ""
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                data = await resp.json()
+                if 'candidates' in data:
+                    full_response = data['candidates'][0]['content']['parts'][0]['text'].strip()
+                
+                await context.bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=placeholder_msg.message_id,
+                    text=full_response or "I couldn't analyze this image.",
+                    parse_mode="Markdown"
+                )
+
+                if full_response:
+                    save_message(user_id, "bot", full_response)
+    except Exception as e:
+        await context.bot.edit_message_text(
+            chat_id=user_id,
+            message_id=placeholder_msg.message_id,
+            text=f"Error analyzing image: {str(e)}"
+        )
+
+
+async def summarize_personality(user_id: int):
+    recent_msgs = get_recent_messages(user_id, 10)
+    if not recent_msgs:
+        return
+    
+    db_user = get_user(user_id)
+    current_personality = db_user.get("personality_summary", "")
+    
+    conversation_text = "\n".join([f"{m['role']}: {m['content']}" for m in recent_msgs])
+    
+    prompt = f"""
+    Based on the following conversation snippets, update the user's personality and fact profile. 
+    Keep it concise and focus on new facts (name, age, likes, dislikes, habits).
+    
+    STRICT RULES:
+    1. Output ONLY the consolidated profile.
+    2. Use HTML tags for formatting: <b>Bold Text</b> for categories.
+    3. Do NOT use Markdown symbols like ** or *.
+    4. Write it in a clean, professional, and easy-to-read way.
+    
+    Previous Profile: {current_personality}
+    
+    Recent Conversation:
+    {conversation_text}
+    """
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GOOGLE_API_KEY}"
+    headers = {
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}]
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                data = await resp.json()
+                new_summary = data['candidates'][0]['content']['parts'][0]['text'].strip()
+                update_personality(user_id, new_summary)
+    except Exception:
+        pass
+
+async def answer_guest_query_http(guest_query_id: str, text: str, parse_mode="Markdown", reply_markup=None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerGuestQuery"
+    result_obj = {
+        "type": "article",
+        "id": "1",
+        "title": "Reply",
+        "input_message_content": {
+            "message_text": text[:4000],
+            "parse_mode": parse_mode
+        }
+    }
+    if reply_markup:
+        result_obj["reply_markup"] = reply_markup
+        
+    payload = {
+        "guest_query_id": guest_query_id,
+        "result": result_obj
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload) as resp:
+            return await resp.json()
+
+async def handle_guest_message(guest_msg: dict, context):
+    user_data = guest_msg.get('from', {})
+    user_id = user_data.get('id')
+    if not user_id: return
+    
+    first_name = user_data.get('first_name', 'User')
+    username = user_data.get('username', '')
+    raw_text = guest_msg.get('text', '')
+    guest_query_id = guest_msg.get('guest_query_id')
+    
+    if not guest_query_id:
+        return
+        
+    # Clean text (remove @username mention)
+    user_message = re.sub(r"^@\w+\s*", "", raw_text).strip()
+    if not user_message:
+        user_message = "Hello Itachi"
+        
+    # DB User check (No auto-registration in groups)
+    db_user = get_user(user_id)
+    if not db_user:
+        reg_msg = (
+            "🛑 <b>Access Denied!</b>\n\n"
+            "You must start the bot in private chat to use this bot.\n"
+            "Please click the button below to start."
+        )
+        reply_markup = {
+            "inline_keyboard": [[{"text": "Start Bot 🤖", "url": "https://t.me/Itachi_Gpt_bot?start=1"}]]
+        }
+        await answer_guest_query_http(guest_query_id, reg_msg, parse_mode="HTML", reply_markup=reply_markup)
+        return
+
+    # Force Join Check
+    from config import FORCE_JOIN_CHANNELS
+    is_joined = True
+    for channel in FORCE_JOIN_CHANNELS:
+        try:
+            member = await context.bot.get_chat_member(chat_id=channel["id"], user_id=user_id)
+            if member.status in ['left', 'kicked', 'restricted']:
+                is_joined = False
+                break
+        except Exception:
+            is_joined = False
+            break
+
+    if not is_joined:
+        join_msg = (
+            "🛑 <b>Access Denied!</b>\n\n"
+            "You must join our official channel to use this bot.\n"
+            "Please join and then click /start again."
+        )
+        
+        inline_keyboard = []
+        for channel in FORCE_JOIN_CHANNELS:
+            inline_keyboard.append([{"text": f"Join Channel {channel['index']} 📣", "url": channel['link']}])
+            
+        reply_markup = {"inline_keyboard": inline_keyboard} if inline_keyboard else None
+        
+        await answer_guest_query_http(guest_query_id, join_msg, parse_mode="HTML", reply_markup=reply_markup)
+        return
+        
+    # Ban Check
+    from datetime import datetime, timezone
+    ban_until = db_user.get("ban_until")
+    if ban_until:
+        ban_until_dt = datetime.fromisoformat(ban_until.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        if now < ban_until_dt:
+            await answer_guest_query_http(guest_query_id, "🛑 You are currently BANNED from using Izanami AI.")
+            return
+
+    # Check Coins
+    is_admin = str(user_id) in ADMIN_IDS
+    if not is_admin and not db_user.get("unlimited_chat") and db_user.get("coins", 0) <= 0:
+        await answer_guest_query_http(
+            guest_query_id, 
+            "⚠️ *Insufficient Coins!*\n\nYou don't have enough coins to chat. Check /plan in private chat for options.", 
+            parse_mode="Markdown"
+        )
+        return
+
+    # Deduct coin
+    if not is_admin:
+        update_user_coins(user_id, -1)
+        
+    # Save user message
+    save_message(user_id, "user", user_message)
+
+    # Generate response (Non-streaming for Guest Mode)
+    full_response = ""
+    system_prompt = ITACHI_PERSONA_PROMPT
+    if db_user.get("personality_summary"):
+        system_prompt += f"\n\nHistorical Context: {db_user.get('personality_summary')}"
+        
+    models = ["gemini-1.5-flash", "gemini-1.5-flash-latest"]
+    contents = []
+    history = get_recent_messages(user_id, limit=6)
+    for msg in reversed(history):
+        role = "user" if msg['role'] == "user" else "model"
+        contents.append({"role": role, "parts": [{"text": msg['content']}]})
+    contents.append({"role": "user", "parts": [{"text": user_message}]})
+    
+    for model_name in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GOOGLE_API_KEY}"
+        payload = {
+            "contents": contents,
+            "system_instruction": {"parts": [{"text": system_prompt}]}
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers={"Content-Type": "application/json"}, json=payload) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if "candidates" in data and data["candidates"]:
+                            full_response = data["candidates"][0]["content"]["parts"][0].get("text", "")
+                            break
+        except Exception as e:
+            print(f"Guest AI error {model_name}: {e}")
+            continue
+            
+    if not full_response:
+        full_response = "🌑 Andhera chha gaya hai... kripya thodi der baad prayaas karein."
+
+    save_message(user_id, "bot", full_response)
+    
+    # Send Guest Reply via HTTP
+    res = await answer_guest_query_http(guest_query_id, full_response, parse_mode="Markdown")
+    print(f"Guest reply status: {res}")
+
+
+async def business_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles messages received via Telegram Business (on behalf of the user)."""
+    business_msg = update.business_message
+    if not business_msg: return
+    
+    # We are acting on behalf of the business account owner, talking TO the sender.
+    connection_id = business_msg.business_connection_id
+    user_message = business_msg.text
+    
+    if not user_message:
+        return
+        
+    # Send placeholder message
+    try:
+        placeholder_msg = await context.bot.send_message(
+            chat_id=business_msg.chat.id,
+            text="Replying...",
+            business_connection_id=connection_id
+        )
+    except Exception as e:
+        print(f"Failed to send business placeholder: {e}")
+        return
+
+    full_response = ""
+    system_prompt = ITACHI_PERSONA_PROMPT + "\n\n[BUSINESS ASSISTANT MODE]: You are replying on behalf of a user's personal Telegram account. Maintain your Itachi persona, but act as their personal assistant. Reply directly to the user who messaged them."
+    
+    models = ["gemini-2.0-flash", "gemini-flash-latest"]
+    contents = [{"role": "user", "parts": [{"text": user_message}]}]
+    
+    last_update_time = 0
+    
+    for model_name in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:streamGenerateContent?alt=sse&key={GOOGLE_API_KEY}"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": contents,
+            "system_instruction": {"parts": [{"text": system_prompt}]}
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=payload) as resp:
+                    if resp.status != 200: continue
+                    
+                    async for line in resp.content:
+                        if not line: continue
+                        line_str = line.decode('utf-8').strip()
+                        if line_str.startswith("data: "):
+                            data_content = line_str[6:]
+                            if data_content == "[DONE]": break
+                            
+                            try:
+                                chunk = json.loads(data_content)
+                                if 'candidates' in chunk:
+                                    content = chunk['candidates'][0]['content']['parts'][0].get('text', '')
+                                    full_response += content
+                                
+                                if time.time() - last_update_time > 0.8 and full_response:
+                                    try:
+                                        await context.bot.edit_message_text(
+                                            chat_id=business_msg.chat.id,
+                                            message_id=placeholder_msg.message_id,
+                                            text=full_response + " ▎",
+                                            parse_mode="Markdown",
+                                            business_connection_id=connection_id
+                                        )
+                                        last_update_time = time.time()
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                continue
+
+                    # Final update
+                    await context.bot.edit_message_text(
+                        chat_id=business_msg.chat.id,
+                        message_id=placeholder_msg.message_id,
+                        text=full_response or "🌑 Itachi remains silent...",
+                        parse_mode="Markdown",
+                        business_connection_id=connection_id
+                    )
+                    return # SUCCESS
+                            
+        except Exception as e:
+            print(f"Error with model {model_name}: {e}")
+            continue
+            
+    # If all models fail
+    try:
+        await context.bot.edit_message_text(
+            chat_id=business_msg.chat.id,
+            message_id=placeholder_msg.message_id,
+            text="🌑 System disruption... I cannot answer right now.",
+            business_connection_id=connection_id
+        )
+    except: pass
