@@ -1,8 +1,7 @@
-python-telegram-bot[job-queue]
+python-telegram-bot[job-queue,webhooks]
 supabase
 python-dotenv
 aiohttp
 shortuuid
 pytz
 apscheduler
-
