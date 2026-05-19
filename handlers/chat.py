@@ -160,7 +160,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     
     # Use a primary and fallback model
-    models = ["gemini-2.0-flash", "gemini-flash-latest"]
+    models = ["gemini-1.5-flash", "gemini-1.5-flash-latest"]
     
     # Structure contents for Gemini (History only)
     contents = []
@@ -298,7 +298,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_caption = update.message.caption or "What is in this image? Summarize it."
     save_message(user_id, "user", f"[Image] {user_caption}")
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={GOOGLE_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GOOGLE_API_KEY}"
     headers = {
         "Content-Type": "application/json"
     }
@@ -376,7 +376,7 @@ async def summarize_personality(user_id: int):
     {conversation_text}
     """
     
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={GOOGLE_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GOOGLE_API_KEY}"
     headers = {
         "Content-Type": "application/json"
     }
@@ -509,7 +509,7 @@ async def handle_guest_message(guest_msg: dict, context):
     if db_user.get("personality_summary"):
         system_prompt += f"\n\nHistorical Context: {db_user.get('personality_summary')}"
         
-    models = ["gemini-2.0-flash", "gemini-flash-latest"]
+    models = ["gemini-1.5-flash", "gemini-1.5-flash-latest"]
     contents = []
     history = get_recent_messages(user_id, limit=6)
     for msg in reversed(history):
