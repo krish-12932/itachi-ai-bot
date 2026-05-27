@@ -21,6 +21,7 @@ from handlers.admin import broadcast_handler, reply_handler, ban_command_handler
 from utils.scheduler import setup_scheduler
 from handlers.rewards import daily_handler, leaderboard_handler
 from handlers.game import game_handler
+from handlers.imagine import imagine_handler
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -163,6 +164,7 @@ async def main():
     application.add_handler(CommandHandler("daily", daily_handler))
     application.add_handler(CommandHandler("top", leaderboard_handler))
     application.add_handler(CommandHandler("game", game_handler))
+    application.add_handler(CommandHandler("imagine", imagine_handler))
     
     # Callback query handler for Join Check
     application.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join$"))
@@ -194,6 +196,7 @@ async def main():
             BotCommand("daily", "🎁 Claim Daily Coins"),
             BotCommand("top", "🏆 View Leaderboard"),
             BotCommand("game", "🎮 Play ninja games"),
+            BotCommand("imagine", "🎨 Generate AI Images"),
             BotCommand("plan", "💎 Get Unlimited Chat"),
             BotCommand("support", "📩 Contact Admin"),
         ]
