@@ -68,10 +68,11 @@ async def imagine_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         # Send the photo directly via URL (Telegram will fetch it)
-        await context.bot.send_photo(
+        await context.bot.send_document(
             chat_id=user_id,
-            photo=image_url,
+            document=image_url,
             caption=caption,
+            filename="Itachi_AI_Generation.jpg",
             parse_mode="HTML"
         )
         
