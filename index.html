@@ -246,34 +246,8 @@
     <!-- Telegram WebApp SDK (Required for TaddySDK) -->
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
 
-    <!-- Dynamic Ad Network Loader -->
-    <script>
-        const urlParams = new URLSearchParams(window.location.search);
-        // Only load Monetag if we are not testing Taddy
-        if (urlParams.get('net') !== 'taddy') {
-            const monetagScript = document.createElement('script');
-            monetagScript.src = '//libtl.com/sdk.js';
-            monetagScript.setAttribute('data-zone', '9545978');
-            monetagScript.setAttribute('data-sdk', 'show_9545978');
-            document.head.appendChild(monetagScript);
-        }
-    </script>
-    <!-- Taddy SDK -->
-    <script src="https://sdk.taddy.pro/web/taddy.min.js?1315" data-pub-id="94d2619938d69de136a8823498e54bf8"></script>
-    <script>
-        // Taddy SDK Initialization & Readiness
-        window.addEventListener('load', function () {
-            if (window.Taddy) {
-                try {
-                    window.Taddy.init('94d2619938d69de136a8823498e54bf8');
-                    window.Taddy.ready();
-                    console.log('TaddySDK is initialized and ready.');
-                } catch (e) {
-                    console.error("Taddy init error:", e);
-                }
-            }
-        });
-    </script>
+    <!-- Monetag Ad SDK -->
+    <script src='//libtl.com/sdk.js' data-zone='9545978' data-sdk='show_9545978'></script>
 </head>
 
 <body>
@@ -328,7 +302,6 @@
         const params = new URLSearchParams(window.location.search);
         const userCode = params.get('code');
         const requiredAds = parseInt(params.get('req') || '1');
-        const adNetwork = params.get('net') || 'monetag';
         let adsWatched = 0;
 
         const startBtn = document.getElementById('startBtn');
@@ -395,56 +368,19 @@
                 resetBtn();
             };
 
-            // Monetag Logic
-            const playMonetag = () => {
-                if (typeof show_9545978 === 'function') {
-                    try {
-                        show_9545978();
-                        handleSuccess();
-                    } catch (err) {
-                        handleFailure(err);
-                    }
-                } else {
-                    alert('Ad SDK nahi mila. Page refresh karein ya AdBlock disable karein.');
-                    resetBtn();
-                }
-            };
-
-            // Network Split Logic
-            if (adNetwork === 'taddy') {
-                if (window.Taddy && typeof window.Taddy.ads === 'function') {
-                    try {
-                        const ads = window.Taddy.ads();
-                        let adCompleted = false;
-                        ads.interstitial({
-                            onViewThrough: (id) => {
-                                console.log('Taddy Ad was viewed completely.', id);
-                                adCompleted = true;
-                                handleSuccess();
-                            },
-                            onClosed: () => {
-                                console.log('Taddy Ad was closed.');
-                                if (!adCompleted) {
-                                    alert("Aapne ad pura nahi dekha! Reward lene ke liye ad pura dekhna zaroori hai.");
-                                    resetBtn();
-                                }
-                            },
-                            onError: (err) => {
-                                console.log("Taddy Ad error or no fill.", err);
-                                handleFailure(err || new Error("No fill"), "Ads are currently not loading. We're sorry for the inconvenience, please try another plan!");
-                            }
-                        });
-                    } catch (err) {
-                        console.log("Taddy interstitial call failed.", err);
-                        handleFailure(err, "Ads are currently not loading. We're sorry for the inconvenience, please try another plan!");
-                    }
-                } else {
-                    alert("Ads are currently not loading. We're sorry for the inconvenience, please try another plan!");
+            // Play Monetag Ad
+            if (typeof show_9545978 === 'function') {
+                try {
+                    show_9545978();
+                    handleSuccess();
+                } catch (err) {
+                    console.error('Monetag Ad Error:', err);
+                    alert('Ad load nahi hua. AdBlocker disable karein aur dobara try karein.');
                     resetBtn();
                 }
             } else {
-                // Default to Monetag
-                playMonetag();
+                alert('Ad SDK nahi mila. Page refresh karein ya AdBlock disable karein.');
+                resetBtn();
             }
         }
 
