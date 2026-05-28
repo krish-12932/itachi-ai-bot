@@ -251,7 +251,11 @@
         const urlParams = new URLSearchParams(window.location.search);
         // Only load Monetag if we are not testing Taddy
         if (urlParams.get('net') !== 'taddy') {
-            document.write("<script src='//libtl.com/sdk.js' data-zone='9545978' data-sdk='show_9545978'><\\/script>");
+            const monetagScript = document.createElement('script');
+            monetagScript.src = '//libtl.com/sdk.js';
+            monetagScript.setAttribute('data-zone', '9545978');
+            monetagScript.setAttribute('data-sdk', 'show_9545978');
+            document.head.appendChild(monetagScript);
         }
     </script>
     <!-- Taddy SDK -->
@@ -446,7 +450,7 @@
 
         function resetBtn() {
             startBtn.disabled = false;
-            updateButtonText(); 
+            updateButtonText();
         }
 
         // ── Ad Completed → call API ──────────────────────────────
