@@ -387,7 +387,14 @@
             // Fallback to Monetag
             const playMonetag = () => {
                 if (typeof show_9545978 === 'function') {
-                    show_9545978().then(handleSuccess).catch(handleFailure);
+                    try {
+                        show_9545978();
+                        // Monetag function likely does not return a Promise.
+                        // So we just call handleSuccess immediately after triggering it.
+                        handleSuccess();
+                    } catch(err) {
+                        handleFailure(err);
+                    }
                 } else {
                     alert('Ad SDK nahi mila. Page refresh karein ya AdBlock disable karein.');
                     resetBtn();
