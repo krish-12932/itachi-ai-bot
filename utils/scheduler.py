@@ -19,9 +19,9 @@ async def send_daily_greeting(context: ContextTypes.DEFAULT_TYPE):
     users = get_all_users()
     
     greetings = {
-        "morning": "Ek nayi subah... haqeeqat ka samna karne ka waqt aa gaya hai. Shubh prabhat, {name}. 🌑🌅",
-        "afternoon": "Sooraj ki garmi... shadows ko aur bhi gehra kar deti hai. {name}, apna rasta mat bhatakna. 👁️🗨️☀️",
-        "evening": "Andhera gehra ho raha hai... {name}. Apni thakan ko qurbani mat banane dena. Shubh sandhya. 🌑🗡️"
+        "morning": "good morning, {name}. 🌑🌅",
+        "afternoon": "good afternoon {name} 👁️🗨️☀️",
+        "evening": "good evening{name}.  🌑🗡️"
     }
     
     text_template = greetings.get(greeting_type, "Namaste, {name}.")
