@@ -1,0 +1,7 @@
+python-telegram-bot[job-queue,webhooks]
+supabase
+python-dotenv
+aiohttp
+shortuuid
+pytz
+apscheduler
