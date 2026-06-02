@@ -336,7 +336,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     full_response = ""
 
     for api_key in GOOGLE_API_KEYS:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
         headers = {
             "Content-Type": "application/json"
         }
@@ -402,7 +402,7 @@ async def summarize_personality(user_id: int):
     }
 
     for api_key in GOOGLE_API_KEYS:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
         headers = {
             "Content-Type": "application/json"
         }
