@@ -77,7 +77,7 @@ async def group_member_updated(update: Update, context: ContextTypes.DEFAULT_TYP
                     except Exception as e:
                         logger.error(f"Failed to auto-delete welcome msg: {e}")
                 
-                asyncio.create_task(delete_later())
+                context.application.create_task(delete_later())
                 
         except Exception as e:
             logger.error(f"Error sending group welcome message via ChatMemberUpdate: {e}")
@@ -116,7 +116,7 @@ async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE
                     except Exception as e:
                         logger.error(f"Failed to auto-delete welcome msg: {e}")
                 
-                asyncio.create_task(delete_later_service())
+                context.application.create_task(delete_later())
                 
         except Exception as e:
             logger.error(f"Error sending welcome message (service msg): {e}")
