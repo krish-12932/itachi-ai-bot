@@ -14,7 +14,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # AI Config
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY",)
 raw_google_keys = os.getenv("GOOGLE_API_KEY", "")
 GOOGLE_API_KEYS = [k.strip() for k in raw_google_keys.split(",") if k.strip()]
 GOOGLE_API_KEY = GOOGLE_API_KEYS[0] if GOOGLE_API_KEYS else ""
