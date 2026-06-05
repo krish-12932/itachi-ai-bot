@@ -49,6 +49,11 @@ def _build_history_contents(chat_id: int, current_msg: str, bot_name: str) -> li
             contents[-1]["parts"][0]["text"] += f"\n{formatted_text}"
         else:
             contents.append({"role": role, "parts": [{"text": formatted_text}]})
+            
+    # CRITICAL FIX: Gemini API requires the VERY FIRST message to be from a "user".
+    # If the history started with a bot message, we must prepend a dummy user message.
+    if contents and contents[0]["role"] == "model":
+        contents.insert(0, {"role": "user", "parts": [{"text": "[System Context]: Previous messages."}]})
     
     # Gemini requires conversation to end with a user message
     if contents and contents[-1]["role"] == "model":
@@ -198,6 +203,9 @@ async def group_ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 if 'candidates' in data and data['candidates']:
                                     full_response = data['candidates'][0]['content']['parts'][0]['text'].strip()
                                     break
+                            else:
+                                err_text = await resp.text()
+                                logger.error(f"Gemini API Error {resp.status}: {err_text}")
                     except Exception as e:
                         logger.error(f"Group AI error {model_name} on key {api_key[:8]}: {e}")
                         continue
