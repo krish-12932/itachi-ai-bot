@@ -7,9 +7,11 @@ from collections import deque
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from config import GOOGLE_API_KEYS
+from config import GOOGLE_API_KEYS, OPENROUTER_API_KEY
 from prompts.itachi_prompts import ITACHI_PERSONA_PROMPT
 from database.group_models import get_group_settings, save_group_ai_message
+
+OPENROUTER_MODEL = "z-ai/glm-4.5-air:free"
 
 logger = logging.getLogger(__name__)
 
@@ -117,11 +119,9 @@ async def group_ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clean_msg = msg_text.replace(f"@{bot_username}", "").strip()
     sender_name = user.first_name if user else "User"
 
-    # Generate response via Gemini
-    if not GOOGLE_API_KEYS:
+    # Need at least one AI provider
+    if not GOOGLE_API_KEYS and not OPENROUTER_API_KEY:
         return
-        
-    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
     
     # Build system prompt
     system_prompt = ITACHI_PERSONA_PROMPT
@@ -142,15 +142,8 @@ async def group_ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif context_type == "proactive":
         system_prompt += "\n\n[TASK]: Make a brief, witty, or observational comment to keep the conversation going."
 
-    # Build conversation history as a single robust prompt
+    # Build conversation history as a single robust prompt string
     history_prompt = _build_history_prompt(chat.id, clean_msg)
-
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": history_prompt}]}],
-
-        "system_instruction": {"parts": [{"text": system_prompt}]}
-    }
-
     full_response = ""
     thinking_msg = None
     
@@ -171,24 +164,66 @@ async def group_ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            for api_key in GOOGLE_API_KEYS:
-                if full_response: break
-                for model_name in models:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-                    headers = {"Content-Type": "application/json"}
-                    try:
-                        async with session.post(url, headers=headers, json=payload) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                if 'candidates' in data and data['candidates']:
-                                    full_response = data['candidates'][0]['content']['parts'][0]['text'].strip()
-                                    break
-                            else:
-                                err_text = await resp.text()
-                                logger.error(f"Gemini API Error {resp.status}: {err_text}")
-                    except Exception as e:
-                        logger.error(f"Group AI error {model_name} on key {api_key[:8]}: {e}")
-                        continue
+            
+            # === PRIMARY: z.ai GLM-4.5 via OpenRouter (Free & Fast) ===
+            if OPENROUTER_API_KEY:
+                try:
+                    or_url = "https://openrouter.ai/api/v1/chat/completions"
+                    or_headers = {
+                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "Content-Type": "application/json",
+                        "HTTP-Referer": "https://itachi-bot.onrender.com",
+                        "X-Title": "Itachi AI Bot"
+                    }
+                    or_messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": history_prompt}
+                    ]
+                    or_payload = {
+                        "model": OPENROUTER_MODEL,
+                        "messages": or_messages,
+                        "max_tokens": 600
+                    }
+                    async with session.post(or_url, headers=or_headers, json=or_payload) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            text = data["choices"][0]["message"]["content"].strip()
+                            if text:
+                                full_response = text
+                                logger.info("OpenRouter GLM-4.5 replied successfully!")
+                        else:
+                            err = await resp.text()
+                            logger.error(f"OpenRouter error ({resp.status}): {err}")
+                except Exception as e:
+                    logger.error(f"OpenRouter exception: {e}")
+            
+            # === FALLBACK: Gemini Models ===
+            if not full_response and GOOGLE_API_KEYS:
+                gemini_models = ["gemini-2.5-flash", "gemini-2.0-flash"]
+                for api_key in GOOGLE_API_KEYS:
+                    if full_response: break
+                    for model_name in gemini_models:
+                        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+                        gemini_payload = {
+                            "contents": [{"role": "user", "parts": [{"text": history_prompt}]}],
+                            "system_instruction": {"parts": [{"text": system_prompt}]}
+                        }
+                        try:
+                            async with session.post(gemini_url, headers={"Content-Type": "application/json"}, json=gemini_payload) as resp:
+                                if resp.status == 200:
+                                    data = await resp.json()
+                                    if 'candidates' in data and data['candidates']:
+                                        full_response = data['candidates'][0]['content']['parts'][0]['text'].strip()
+                                        if full_response: break
+                                elif resp.status == 429:
+                                    logger.warning(f"Gemini {model_name} rate limited, trying next...")
+                                    continue
+                                else:
+                                    err_text = await resp.text()
+                                    logger.error(f"Gemini API Error {resp.status}: {err_text}")
+                        except Exception as e:
+                            logger.error(f"Group AI error {model_name}: {e}")
+                            continue
         
         # Stop the typing loop
         typing_task.cancel()
