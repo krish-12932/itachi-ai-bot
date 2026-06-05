@@ -27,45 +27,24 @@ def _add_to_history(chat_id: int, sender_name: str, text: str, is_bot: bool = Fa
         GROUP_HISTORY[chat_id] = deque(maxlen=MAX_HISTORY)
     GROUP_HISTORY[chat_id].append((sender_name, text, is_bot))
 
-def _build_history_contents(chat_id: int, current_msg: str, bot_name: str) -> list:
+def _build_history_prompt(chat_id: int, current_msg: str) -> str:
     """
-    Build Gemini-compatible contents list from history.
-    Groups consecutive same-role messages together.
-    Format: [{role: user, parts: [{text: ...}]}, {role: model, ...}]
+    Builds a single robust text prompt containing the chat history.
+    This avoids Gemini's strict multi-turn role rules which cause 400 Bad Request errors.
     """
     history = list(GROUP_HISTORY.get(chat_id, []))
     
     if not history:
-        return [{"role": "user", "parts": [{"text": current_msg}]}]
-    
-    contents = []
-    
-    for sender_name, text, is_bot in history:
-        role = "model" if is_bot else "user"
-        formatted_text = text if is_bot else f"[{sender_name}]: {text}"
+        return current_msg
         
-        # Merge consecutive same-role messages
-        if contents and contents[-1]["role"] == role:
-            contents[-1]["parts"][0]["text"] += f"\n{formatted_text}"
-        else:
-            contents.append({"role": role, "parts": [{"text": formatted_text}]})
-            
-    # CRITICAL FIX: Gemini API requires the VERY FIRST message to be from a "user".
-    # If the history started with a bot message, we must prepend a dummy user message.
-    if contents and contents[0]["role"] == "model":
-        contents.insert(0, {"role": "user", "parts": [{"text": "[System Context]: Previous messages."}]})
+    prompt_lines = ["--- RECENT CHAT HISTORY ---"]
+    for sender_name, text, is_bot in history:
+        prompt_lines.append(f"[{sender_name}]: {text}")
     
-    # Gemini requires conversation to end with a user message
-    if contents and contents[-1]["role"] == "model":
-        contents.append({"role": "user", "parts": [{"text": f"[User]: {current_msg}"}]})
-    else:
-        # Append current message to last user block or create new
-        if contents and contents[-1]["role"] == "user":
-            contents[-1]["parts"][0]["text"] += f"\n[User]: {current_msg}"
-        else:
-            contents.append({"role": "user", "parts": [{"text": f"[User]: {current_msg}"}]})
+    prompt_lines.append("--- END HISTORY ---")
+    prompt_lines.append(f"\n[CURRENT MESSAGE to reply to]: {current_msg}")
     
-    return contents
+    return "\n".join(prompt_lines)
 
 
 async def group_message_logger(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -163,11 +142,12 @@ async def group_ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif context_type == "proactive":
         system_prompt += "\n\n[TASK]: Make a brief, witty, or observational comment to keep the conversation going."
 
-    # Build conversation history as Gemini contents
-    contents = _build_history_contents(chat.id, clean_msg, bot_name)
+    # Build conversation history as a single robust prompt
+    history_prompt = _build_history_prompt(chat.id, clean_msg)
 
     payload = {
-        "contents": contents,
+        "contents": [{"role": "user", "parts": [{"text": history_prompt}]}],
+
         "system_instruction": {"parts": [{"text": system_prompt}]}
     }
 
