@@ -5,8 +5,7 @@ from datetime import datetime
 from telegram import Update, ChatPermissions
 from telegram.ext import ContextTypes
 import aiohttp
-from config import GOOGLE_API_KEYS
-
+from config import GOOGLE_API_KEYS, OPENROUTER_API_KEY
 from database.group_models import (
     get_group_settings, add_warning, get_user_warning, reset_warnings, add_ban
 )
@@ -16,8 +15,17 @@ logger = logging.getLogger(__name__)
 # Temporary in-memory store for rate limiting: {group_id: {user_id: [timestamp1, timestamp2, ...]}}
 RATE_LIMITS = {}
 
-# Regex for detecting promotional links and other bot tags (@...bot)
-LINK_REGEX = re.compile(r'(https?://[^\s]+|t\.me/[^\s]+|@\w+bot\b|join my channel|subscribe to)', re.IGNORECASE)
+# Regex for actual spam/promo links ONLY (not normal @mentions)
+# Catches: http links, t.me invite links, t.me/+xxx joins, t.me/@channel promotions
+LINK_REGEX = re.compile(
+    r'(https?://[^\s]+|'           # Any http/https URL
+    r't\.me/\+[^\s]+|'             # t.me/+invite_hash (join links)
+    r't\.me/joinchat/[^\s]+|'      # t.me/joinchat/xxx
+    r'join\s+my\s+(channel|group)|' # "join my channel/group"
+    r'subscribe\s+to\b)',           # "subscribe to"
+    re.IGNORECASE
+)
+OPENROUTER_MODEL_MOD = "z-ai/glm-4.5-air:free"
 
 async def check_rate_limit(group_id: int, user_id: int) -> bool:
     """Returns True if the user is spamming (5 msgs / 10 sec)"""
@@ -59,59 +67,91 @@ async def _silent_delete(update: Update, reason: str):
         logger.error(f"Failed to delete message ({reason}): {e}")
 
 async def is_ai_promotion(text: str) -> bool:
-    """Uses Gemini AI to detect promotions/spam with JSON response."""
+    """Uses AI to detect promotions/spam. OpenRouter primary, Gemini fallback."""
     if len(text) < 20:
         return False
 
-    if not GOOGLE_API_KEYS:
-        return False
+    prompt = f"""You are a Telegram group moderation AI.
+Analyze this message and reply in JSON ONLY, nothing else:
 
-    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
-    prompt = f"""You are a group moderation AI.
-Analyze this message and respond in JSON only, nothing else:
+{{"is_promotion": true/false, "confidence": 0-100}}
 
-{{
-  'is_promotion': true/false,
-  'confidence': 0-100
-}}
-
-Promotion means:
-- Advertising any product/service
-- Bot/channel promotion
+Promotion/Spam means:
+- Advertising any product/service/bot/channel
 - Referral or earning links
 - Selling anything
-- Any @username or link promotion
+- Unsolicited channel/group invites
+- Copy-paste spam text
+
+Normal conversation, questions, or discussions are NOT promotions.
 
 Message: {text}"""
 
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}]
-    }
+    # --- PRIMARY: OpenRouter GLM-4.5 ---
+    if OPENROUTER_API_KEY:
+        try:
+            import json as json_lib
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                or_url = "https://openrouter.ai/api/v1/chat/completions"
+                or_headers = {
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://itachi-bot.onrender.com",
+                    "X-Title": "Itachi Moderation"
+                }
+                or_payload = {
+                    "model": OPENROUTER_MODEL_MOD,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 50
+                }
+                async with session.post(or_url, headers=or_headers, json=or_payload) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        reply = data["choices"][0]["message"]["content"].strip()
+                        try:
+                            result = json_lib.loads(reply.replace("'", '"'))
+                            if result.get('is_promotion') and result.get('confidence', 0) >= 70:
+                                return True
+                            return False  # Got a valid answer - trust it
+                        except Exception:
+                            if "true" in reply.lower() and "false" not in reply.lower():
+                                return True
+                            return False
+        except Exception as e:
+            logger.error(f"OpenRouter promo check error: {e}")
 
+    # --- FALLBACK: Gemini ---
+    if not GOOGLE_API_KEYS:
+        return False
+
+    gemini_payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
     try:
+        import json as json_lib
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for api_key in GOOGLE_API_KEYS:
-                for model_name in models:
+                for model_name in ["gemini-2.5-flash", "gemini-2.0-flash"]:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
                     try:
-                        async with session.post(url, headers={"Content-Type": "application/json"}, json=payload) as resp:
+                        async with session.post(url, headers={"Content-Type": "application/json"}, json=gemini_payload) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
                                 if 'candidates' in data and data['candidates']:
                                     reply = data['candidates'][0]['content']['parts'][0]['text'].strip()
                                     try:
-                                        import json as json_lib
                                         result = json_lib.loads(reply.replace("'", '"'))
-                                        if result.get('is_promotion') and result.get('confidence', 0) >= 60:
+                                        if result.get('is_promotion') and result.get('confidence', 0) >= 70:
                                             return True
+                                        return False
                                     except Exception:
                                         if "true" in reply.lower() and "false" not in reply.lower():
                                             return True
+                                        return False
                     except Exception:
                         continue
     except Exception as e:
-        logger.error(f"AI Promo check error: {e}")
+        logger.error(f"Gemini promo check error: {e}")
 
     return False
 
