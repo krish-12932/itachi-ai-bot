@@ -22,7 +22,7 @@ GOOGLE_API_KEY = GOOGLE_API_KEYS[0] if GOOGLE_API_KEYS else ""
 # Web Server Config
 PORT = int(os.getenv("PORT", 8080))
 web_domain_env = os.getenv("WEB_DOMAIN", "")
-render_url_env = os.getenv("RENDER_EXTERNAL_URL", "")
+render_url_env = os.getenv("RENDER_EXTERNAL_URL", "https://itachi-ai-bot-ocdq.onrender.com")
 
 if web_domain_env:
     WEB_DOMAIN = web_domain_env.rstrip("/")
