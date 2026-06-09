@@ -198,7 +198,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     
     # Use primary + fallback models (tries in order)
-    models = ["gemini-2.5-flash-lite-preview-06-17", "gemini-2.0-flash", "gemini-1.5-flash"]
+    models = ["gemini-2.5-flash", "gemini-2.0-flash"]
    
     # Structure contents for Gemini (History only)
     contents = []
