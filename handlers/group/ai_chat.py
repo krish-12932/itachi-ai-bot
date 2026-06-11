@@ -199,7 +199,7 @@ async def group_ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # === FALLBACK: Gemini Models ===
             if not full_response and GOOGLE_API_KEYS:
-                gemini_models = ["gemini-2.5-flash", "gemini-2.0-flash"]
+                gemini_models = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite-preview-06-17", "gemini-2.0-flash"]
                 for api_key in GOOGLE_API_KEYS:
                     if full_response: break
                     for model_name in gemini_models:
