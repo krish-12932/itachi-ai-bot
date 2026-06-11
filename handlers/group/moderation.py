@@ -15,14 +15,16 @@ logger = logging.getLogger(__name__)
 # Temporary in-memory store for rate limiting: {group_id: {user_id: [timestamp1, timestamp2, ...]}}
 RATE_LIMITS = {}
 
-# Regex for actual spam/promo links ONLY (not normal @mentions)
-# Catches: http links, t.me invite links, t.me/+xxx joins, t.me/@channel promotions
+# Regex for spam/promo detection
+# Catches: http links, t.me invite links, bot username promotions
 LINK_REGEX = re.compile(
-    r'(https?://[^\s]+|'           # Any http/https URL
-    r't\.me/\+[^\s]+|'             # t.me/+invite_hash (join links)
-    r't\.me/joinchat/[^\s]+|'      # t.me/joinchat/xxx
-    r'join\s+my\s+(channel|group)|' # "join my channel/group"
-    r'subscribe\s+to\b)',           # "subscribe to"
+    r'(https?://[^\s]+|'              # Any http/https URL
+    r't\.me/\+[^\s]+|'               # t.me/+invite_hash (join links)
+    r't\.me/joinchat/[^\s]+|'        # t.me/joinchat/xxx
+    r'@[a-zA-Z0-9_]*_bot\b|'         # @username_bot (underscore style)
+    r'@[a-zA-Z0-9]{4,}bot\b|'        # @usernamebot (no underscore, min 4 chars before bot)
+    r'join\s+my\s+(channel|group)|'  # "join my channel/group"
+    r'subscribe\s+to\b)',             # "subscribe to"
     re.IGNORECASE
 )
 OPENROUTER_MODEL_MOD = "z-ai/glm-4.5-air:free"
@@ -131,7 +133,7 @@ Message: {text}"""
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for api_key in GOOGLE_API_KEYS:
-                for model_name in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+                for model_name in ["gemini-2.5-flash-lite-preview-06-17", "gemini-2.0-flash"]:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
                     try:
                         async with session.post(url, headers={"Content-Type": "application/json"}, json=gemini_payload) as resp:
@@ -222,8 +224,16 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # 1. Anti-Link / Anti-Promotion
-    bot_username = context.bot.username
-    clean_msg_for_link_check = msg_text.replace(f"@{bot_username}", "")
+    bot_username = context.bot.username or ""
+    group_username = chat.username or ""
+    
+    # Remove our own bot's @mention AND group's own @username before checking
+    # This prevents false positives when admin tags bot or group username
+    clean_msg_for_link_check = msg_text
+    if bot_username:
+        clean_msg_for_link_check = clean_msg_for_link_check.replace(f"@{bot_username}", "")
+    if group_username:
+        clean_msg_for_link_check = clean_msg_for_link_check.replace(f"@{group_username}", "")
 
     is_promo = bool(LINK_REGEX.search(clean_msg_for_link_check))
     
