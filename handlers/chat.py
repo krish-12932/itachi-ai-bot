@@ -198,8 +198,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     
     # Use primary + fallback models (tries in order)
-    models = ["gemini-2.5-flash", "gemini-2.0-flash"]
-   
+    models = ["gemini-2.5-flash-lite-preview-06-17", "gemini-2.5-flash", "gemini-2.0-flash"]
+    
     # Structure contents for Gemini (History only)
     contents = []
     history = get_recent_messages(user_id, limit=6)
@@ -359,7 +359,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     full_response = ""
-    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    models = ["gemini-2.5-flash-lite-preview-06-17", "gemini-2.5-flash", "gemini-2.0-flash"]
 
     for api_key in GOOGLE_API_KEYS:
         for model_name in models:
@@ -433,7 +433,7 @@ async def summarize_personality(user_id: int):
         "contents": [{"parts": [{"text": prompt}]}]
     }
 
-    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    models = ["gemini-2.5-flash-lite-preview-06-17", "gemini-2.5-flash", "gemini-2.0-flash"]
     for api_key in GOOGLE_API_KEYS:
         for model_name in models:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
@@ -575,7 +575,7 @@ async def handle_guest_message(guest_msg: dict, context):
     if db_user.get("personality_summary"):
         system_prompt += f"\n\nHistorical Context: {db_user.get('personality_summary')}"
         
-    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    models = ["gemini-2.5-flash-lite-preview-06-17", "gemini-2.5-flash", "gemini-2.0-flash"]
     contents = []
     history = get_recent_messages(user_id, limit=6)
     for msg in reversed(history):
@@ -644,7 +644,7 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
     full_response = ""
     system_prompt = ITACHI_PERSONA_PROMPT + "\n\n[BUSINESS ASSISTANT MODE]: You are replying on behalf of a user's personal Telegram account. Maintain your Itachi persona, but act as their personal assistant. Reply directly to the user who messaged them."
     
-    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    models = ["gemini-2.5-flash-lite-preview-06-17", "gemini-2.5-flash", "gemini-2.0-flash"]
     contents = [{"role": "user", "parts": [{"text": user_message}]}]
     
     last_update_time = 0
