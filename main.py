@@ -237,7 +237,10 @@ async def main():
             BotCommand("myunban", "🔓 Unban yourself from a group"),
             BotCommand("groupsetup", "⚙️ Configure Group Settings"),
         ]
-        await application.bot.set_my_commands(commands)
+        try:
+            await application.bot.set_my_commands(commands, read_timeout=20)
+        except Exception as e:
+            logger.error(f"Error setting global commands: {e}")
         
         # Admin commands (For all admins in ADMIN_IDS)
         if ADMIN_IDS:
