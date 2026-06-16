@@ -97,7 +97,8 @@ async def handle_telegram_webhook(request):
     try:
         data = await request.json()
         update = Update.de_json(data, application.bot)
-        await application.update_queue.put(update)
+        # process_update() directly dispatches to registered handlers
+        await application.process_update(update)
         return web.Response(text="OK")
     except Exception as e:
         logger.error(f"Error handling Telegram webhook: {e}")
@@ -296,3 +297,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user.")
+
