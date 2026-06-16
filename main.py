@@ -224,50 +224,13 @@ async def main():
     async with application:
         await application.start()
         
-        # Set menu commands
-        commands = [
-            BotCommand("start", "🚀 Start the bot"),
-            BotCommand("profile", "👤 View Profile"),
-            BotCommand("referral", "🎁 Earn Coins"),
-            BotCommand("daily", "🎁 Claim Daily Coins"),
-            BotCommand("top", "🏆 View Leaderboard"),
-            BotCommand("imagine", "🎨 Generate AI Images"),
-            BotCommand("plan", "💎 Get Unlimited Chat"),
-            BotCommand("support", "📩 Contact Admin"),
-            BotCommand("myunban", "🔓 Unban yourself from a group"),
-            BotCommand("groupsetup", "⚙️ Configure Group Settings"),
-        ]
-        try:
-            await application.bot.set_my_commands(commands, read_timeout=20)
-        except Exception as e:
-            logger.error(f"Error setting global commands: {e}")
-        
-        # Admin commands (For all admins in ADMIN_IDS)
-        if ADMIN_IDS:
-            admin_commands = commands + [
-                BotCommand("broadcast", "📢 Broadcast message to all users"),
-                BotCommand("reply", "📩 Reply to a support ticket"),
-                BotCommand("ban", "🚫 Ban a user"),
-                BotCommand("unban", "✅ Unban a user"),
-                BotCommand("givecoins", "🪙 Give/remove coins from a user"),
-                BotCommand("stats", "📊 View bot statistics")
-            ]
-            for admin_id in ADMIN_IDS:
-                try:
-                    await application.bot.set_my_commands(
-                        admin_commands, 
-                        scope=BotCommandScopeChat(chat_id=int(admin_id))
-                    )
-                except Exception as e:
-                    logger.error(f"Error setting commands for admin {admin_id}: {e}")
-        
         # Setup Daily Greetings Scheduler
         setup_scheduler(application)
         
         # Start keep-alive ping task
         asyncio.create_task(keep_alive_ping())
         
-        # Webhook vs Polling logic
+        # Webhook vs Polling logic — START WEB SERVER FIRST so Render detects port immediately
         RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
         
         if RENDER_EXTERNAL_URL:
@@ -280,9 +243,50 @@ async def main():
         else:
             # Local Polling Mode
             logger.info("🤖 Local environment detected! Starting Polling...")
-            await start_web_server() # Start dummy server for local testing if needed
+            await start_web_server()
             await application.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+        # Set bot commands in background (non-blocking so web server starts fast)
+        async def setup_commands():
+            await asyncio.sleep(5)  # wait a bit after server is up
+            commands = [
+                BotCommand("start", "🚀 Start the bot"),
+                BotCommand("profile", "👤 View Profile"),
+                BotCommand("referral", "🎁 Earn Coins"),
+                BotCommand("daily", "🎁 Claim Daily Coins"),
+                BotCommand("top", "🏆 View Leaderboard"),
+                BotCommand("imagine", "🎨 Generate AI Images"),
+                BotCommand("plan", "💎 Get Unlimited Chat"),
+                BotCommand("support", "📩 Contact Admin"),
+                BotCommand("myunban", "🔓 Unban yourself from a group"),
+                BotCommand("groupsetup", "⚙️ Configure Group Settings"),
+            ]
+            try:
+                await application.bot.set_my_commands(commands, read_timeout=30)
+                logger.info("✅ Bot commands set successfully")
+            except Exception as e:
+                logger.error(f"Error setting global commands: {e}")
             
+            if ADMIN_IDS:
+                admin_commands = commands + [
+                    BotCommand("broadcast", "📢 Broadcast message to all users"),
+                    BotCommand("reply", "📩 Reply to a support ticket"),
+                    BotCommand("ban", "🚫 Ban a user"),
+                    BotCommand("unban", "✅ Unban a user"),
+                    BotCommand("givecoins", "🪙 Give/remove coins from a user"),
+                    BotCommand("stats", "📊 View bot statistics")
+                ]
+                for admin_id in ADMIN_IDS:
+                    try:
+                        await application.bot.set_my_commands(
+                            admin_commands,
+                            scope=BotCommandScopeChat(chat_id=int(admin_id))
+                        )
+                    except Exception as e:
+                        logger.error(f"Error setting commands for admin {admin_id}: {e}")
+
+        asyncio.create_task(setup_commands())
+
         # Keep running
         while True:
             await asyncio.sleep(3600)
