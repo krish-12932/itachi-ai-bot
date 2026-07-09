@@ -11,7 +11,7 @@ from config import GOOGLE_API_KEYS, OPENROUTER_API_KEY
 from prompts.itachi_prompts import ITACHI_PERSONA_PROMPT
 from database.group_models import get_group_settings, save_group_ai_message
 
-OPENROUTER_MODEL = "z-ai/glm-4.5-air:free"
+OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 
 logger = logging.getLogger(__name__)
 
@@ -199,7 +199,7 @@ async def group_ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # === FALLBACK: Gemini Models ===
             if not full_response and GOOGLE_API_KEYS:
-                gemini_models = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite-preview-06-17", "gemini-2.0-flash"]
+                gemini_models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
                 for api_key in GOOGLE_API_KEYS:
                     if full_response: break
                     for model_name in gemini_models:
