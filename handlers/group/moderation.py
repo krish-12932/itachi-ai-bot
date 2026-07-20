@@ -27,7 +27,7 @@ LINK_REGEX = re.compile(
     r'subscribe\s+to\b)',             # "subscribe to"
     re.IGNORECASE
 )
-OPENROUTER_MODEL_MOD = "z-ai/glm-4.5-air:free"
+OPENROUTER_MODEL_MOD = "google/gemini-2.0-flash-lite-preview-02-05:free"
 
 async def check_rate_limit(group_id: int, user_id: int) -> bool:
     """Returns True if the user is spamming (5 msgs / 10 sec)"""
@@ -73,13 +73,13 @@ async def is_ai_promotion(text: str) -> bool:
     if len(text) < 20:
         return False
 
-    prompt = f"""You are a Telegram group moderation AI.
-Analyze this message and reply in JSON ONLY, nothing else:
+    prompt = f"""You are a strict Telegram group moderation AI.
+Analyze this message and reply in RAW JSON ONLY. No markdown, no backticks, no explanation.
 
-{{"is_promotion": true/false, "confidence": 0-100}}
+{{"is_promotion": true, "confidence": 90}}
 
 Promotion/Spam means:
-- Advertising any product/service/bot/channel
+- Advertising any product/service/bot/channel/crypto
 - Referral or earning links
 - Selling anything
 - Unsolicited channel/group invites
@@ -111,6 +111,8 @@ Message: {text}"""
                     if resp.status == 200:
                         data = await resp.json()
                         reply = data["choices"][0]["message"]["content"].strip()
+                        # Strip markdown if model ignored instructions
+                        reply = reply.strip("`").lstrip("json").strip()
                         try:
                             result = json_lib.loads(reply.replace("'", '"'))
                             if result.get('is_promotion') and result.get('confidence', 0) >= 70:
@@ -133,7 +135,7 @@ Message: {text}"""
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for api_key in GOOGLE_API_KEYS:
-                for model_name in ["gemini-2.5-flash-lite-preview-06-17", "gemini-2.0-flash"]:
+                for model_name in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
                     try:
                         async with session.post(url, headers={"Content-Type": "application/json"}, json=gemini_payload) as resp:
@@ -141,6 +143,7 @@ Message: {text}"""
                                 data = await resp.json()
                                 if 'candidates' in data and data['candidates']:
                                     reply = data['candidates'][0]['content']['parts'][0]['text'].strip()
+                                    reply = reply.strip("`").lstrip("json").strip()
                                     try:
                                         result = json_lib.loads(reply.replace("'", '"'))
                                         if result.get('is_promotion') and result.get('confidence', 0) >= 70:
