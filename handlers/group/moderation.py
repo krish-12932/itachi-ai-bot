@@ -1,6 +1,7 @@
 import logging
 import re
 import asyncio
+import html
 from datetime import datetime
 from telegram import Update, ChatPermissions
 from telegram.ext import ContextTypes
@@ -85,71 +86,133 @@ async def _silent_delete(update: Update, reason: str):
     except Exception as e:
         logger.error(f"Failed to delete message ({reason}): {e}")
 
+import json as _json_mod
+import re as _re_mod
+
+# In-memory result cache to avoid repeated AI calls for the same text
+_PROMO_CACHE: dict = {}
+_PROMO_CACHE_MAX = 500
+
+# Quick pre-filter: catch obvious spam patterns WITHOUT an AI call (much faster)
+_QUICK_PROMO_RE = re.compile(
+    r'(earn\s+\d+|per\s+day|daily\s+earn|free\s+money|make\s+money|instant\s+withdraw|'
+    r'join\s+now|click\s+here|dm\s+me|message\s+me|check\s+my\s+(bio|profile|link)|'
+    r'visit\s+my|promote\s+your|advertisement|sponsored|referral\s+code|invite\s+link|'
+    r'airdrop|giveaway|crypto\s+signal|bitcoin|invest\s+now|passive\s+income|work\s+from\s+home)',
+    re.IGNORECASE
+)
+
+def _extract_json_result(reply: str):
+    """Robustly extract JSON even if model wraps in markdown or adds extra text."""
+    reply = reply.strip().strip("`")
+    if reply.lower().startswith("json"):
+        reply = reply[4:].strip()
+    # Try to find a JSON object with regex
+    match = _re_mod.search(r'\{[^}]+\}', reply)
+    if match:
+        try:
+            return _json_mod.loads(match.group().replace("'", '"'))
+        except Exception:
+            pass
+    try:
+        return _json_mod.loads(reply.replace("'", '"'))
+    except Exception:
+        return None
+
 async def is_ai_promotion(text: str) -> bool:
-    """Uses AI to detect promotions/spam. OpenRouter primary, Gemini fallback."""
+    """Uses AI to detect promotions/spam. OpenRouter primary, Gemini fallback.
+    Features: quick-regex pre-filter, result caching, robust JSON parsing, few-shot prompt."""
+
+    text = text.strip()
+
+    # 1. Too short to be meaningful spam
     if len(text) < 20:
         return False
 
-    prompt = f"""You are a strict Telegram group moderation AI.
-Analyze this message and reply in RAW JSON ONLY. No markdown, no backticks, no explanation.
+    # 2. Quick regex pre-filter (no API call needed for obvious patterns)
+    if _QUICK_PROMO_RE.search(text):
+        logger.info(f"Promo quick-detected (regex): {text[:60]}")
+        return True
 
-{{"is_promotion": true, "confidence": 90}}
+    # 3. Cache check: skip AI if we've seen this exact message recently
+    cache_key = text.lower()[:200]
+    if cache_key in _PROMO_CACHE:
+        return _PROMO_CACHE[cache_key]
 
-Promotion/Spam means:
-- Advertising any product/service/bot/channel/crypto
-- Referral or earning links
-- Selling anything
-- Unsolicited channel/group invites
-- Copy-paste spam text
+    def _cache(val: bool):
+        if len(_PROMO_CACHE) >= _PROMO_CACHE_MAX:
+            for k in list(_PROMO_CACHE.keys())[:_PROMO_CACHE_MAX // 2]:
+                del _PROMO_CACHE[k]
+        _PROMO_CACHE[cache_key] = val
+        return val
 
-Normal conversation, questions, or discussions are NOT promotions.
+    # 4. AI prompt with few-shot examples for better accuracy
+    prompt = f"""You are a Telegram group spam/promotion detector.
 
-Message: {text}"""
+Reply ONLY with raw JSON, no markdown, no explanation:
+{{"is_promotion": true or false, "confidence": 0-100}}
 
-    # --- PRIMARY: OpenRouter GLM-4.5 ---
+SPAM/PROMOTION (true):
+- "Join my channel for free signals @mychannel"
+- "Earn $500/day,DM me now!"
+- "I will promote your channel cheaply"
+- "Check my bio for the referral link"
+- "Airdrop live! Claim now"
+
+NOT SPAM (false):
+- "What time does the match start?"
+- "I love this song!"
+- "Can anyone help me with Python?"
+- "Bhai kya scene hai aaj?"
+
+Classify this message:
+{text}"""
+
+    # --- PRIMARY: OpenRouter ---
     if OPENROUTER_API_KEY:
         try:
-            import json as json_lib
-            timeout = aiohttp.ClientTimeout(total=10)
+            timeout = aiohttp.ClientTimeout(total=8)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                or_url = "https://openrouter.ai/api/v1/chat/completions"
-                or_headers = {
+                payload = {
+                    "model": OPENROUTER_MODEL_MOD,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 60,
+                    "temperature": 0.0
+                }
+                headers = {
                     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                     "Content-Type": "application/json",
                     "HTTP-Referer": "https://itachi-bot.onrender.com",
                     "X-Title": "Itachi Moderation"
                 }
-                or_payload = {
-                    "model": OPENROUTER_MODEL_MOD,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 50
-                }
-                async with session.post(or_url, headers=or_headers, json=or_payload) as resp:
+                async with session.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        reply = data["choices"][0]["message"]["content"].strip()
-                        # Strip markdown if model ignored instructions
-                        reply = reply.strip("`").lstrip("json").strip()
-                        try:
-                            result = json_lib.loads(reply.replace("'", '"'))
-                            if result.get('is_promotion') and result.get('confidence', 0) >= 70:
-                                return True
-                            return False  # Got a valid answer - trust it
-                        except Exception:
-                            if "true" in reply.lower() and "false" not in reply.lower():
-                                return True
-                            return False
+                        reply = data["choices"][0]["message"]["content"]
+                        parsed = _extract_json_result(reply)
+                        if parsed is not None:
+                            is_promo = bool(parsed.get("is_promotion")) and parsed.get("confidence", 0) >= 75
+                            return _cache(is_promo)
+                        # Fallback text parse
+                        if "true" in reply.lower() and "false" not in reply.lower():
+                            return _cache(True)
+                        return _cache(False)
+                    else:
+                        body = await resp.text()
+                        logger.warning(f"OpenRouter mod error ({resp.status}): {body[:150]}")
         except Exception as e:
             logger.error(f"OpenRouter promo check error: {e}")
 
-    # --- FALLBACK: Gemini ---
+    # --- FALLBACK: Gemini Direct API ---
     if not GOOGLE_API_KEYS:
         return False
 
-    gemini_payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
+    gemini_payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 60}
+    }
     try:
-        import json as json_lib
-        timeout = aiohttp.ClientTimeout(total=10)
+        timeout = aiohttp.ClientTimeout(total=8)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for api_key in GOOGLE_API_KEYS:
                 for model_name in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]:
@@ -158,18 +221,17 @@ Message: {text}"""
                         async with session.post(url, headers={"Content-Type": "application/json"}, json=gemini_payload) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
-                                if 'candidates' in data and data['candidates']:
-                                    reply = data['candidates'][0]['content']['parts'][0]['text'].strip()
-                                    reply = reply.strip("`").lstrip("json").strip()
-                                    try:
-                                        result = json_lib.loads(reply.replace("'", '"'))
-                                        if result.get('is_promotion') and result.get('confidence', 0) >= 70:
-                                            return True
-                                        return False
-                                    except Exception:
-                                        if "true" in reply.lower() and "false" not in reply.lower():
-                                            return True
-                                        return False
+                                if data.get('candidates'):
+                                    reply = data['candidates'][0]['content']['parts'][0]['text']
+                                    parsed = _extract_json_result(reply)
+                                    if parsed is not None:
+                                        is_promo = bool(parsed.get("is_promotion")) and parsed.get("confidence", 0) >= 75
+                                        return _cache(is_promo)
+                                    if "true" in reply.lower() and "false" not in reply.lower():
+                                        return _cache(True)
+                                    return _cache(False)
+                            elif resp.status == 429:
+                                continue
                     except Exception:
                         continue
     except Exception as e:
@@ -209,21 +271,23 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async def apply_punishment(reason: str, ban_db_reason: str):
         if punishment_mode == "ban":
             try:
+                safe_name = html.escape(user.first_name)
                 await chat.ban_member(user.id)
                 add_ban(chat.id, user.id, ban_db_reason)
                 await context.bot.send_message(
                     chat.id,
-                    f"🚫 *{user.first_name} has been Banned!*\n\n"
+                    f"🚫 <b>{safe_name} has been Banned!</b>\n\n"
                     f"📋 Reason: {reason}\n"
                     f"To unban yourself, message @{context.bot.username} and send:\n"
-                    f"`/myunban {chat.id}`",
-                    parse_mode="Markdown"
+                    f"<code>/myunban {chat.id}</code>",
+                    parse_mode="HTML"
                 )
                 reset_warnings(chat.id, user.id)
             except Exception as e:
                 logger.error(f"Error banning user: {e}")
         else:  # mute
             try:
+                safe_name = html.escape(user.first_name)
                 await chat.restrict_member(
                     user.id,
                     permissions=ChatPermissions(can_send_messages=False),
@@ -231,8 +295,8 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await context.bot.send_message(
                     chat.id,
-                    f"🔇 *{user.first_name} has been Muted for 5 minutes!*\n\n📋 Reason: {reason}",
-                    parse_mode="Markdown"
+                    f"🔇 <b>{safe_name} has been Muted for 5 minutes!</b>\n\n📋 Reason: {reason}",
+                    parse_mode="HTML"
                 )
                 reset_warnings(chat.id, user.id)
             except Exception as e:
@@ -269,13 +333,17 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Warning mode: delete + warn + punish on 3rd
             await _silent_delete(update, "link")
             warning_count = add_warning(chat.id, user.id)
-            if warning_count == 1:
-                await context.bot.send_message(chat.id, f"⚠️ *First Warning* for {user.first_name}!\nLinks/Promotions are not allowed here.", parse_mode="Markdown")
-            elif warning_count == 2:
-                action_text = "BANNED" if punishment_mode == "ban" else "MUTED"
-                await context.bot.send_message(chat.id, f"⚠️ *Second Warning* for {user.first_name}!\nOne more link and you will be {action_text}.", parse_mode="Markdown")
-            elif warning_count >= 3:
-                await apply_punishment("3 Warnings for sending Links/Promotions.", "promotion")
+            safe_name = html.escape(user.first_name)
+            try:
+                if warning_count == 1:
+                    await context.bot.send_message(chat.id, f"⚠️ <b>First Warning</b> for {safe_name}!\nLinks/Promotions are not allowed here.", parse_mode="HTML")
+                elif warning_count == 2:
+                    action_text = "BANNED" if punishment_mode == "ban" else "MUTED"
+                    await context.bot.send_message(chat.id, f"⚠️ <b>Second Warning</b> for {safe_name}!\nOne more link and you will be {action_text}.", parse_mode="HTML")
+                elif warning_count >= 3:
+                    await apply_punishment("3 Warnings for sending Links/Promotions.", "promotion")
+            except Exception as e:
+                logger.error(f"Error sending warning: {e}")
             return
 
     # 1.5 AI Promo Detect (separate toggle - silent delete only)
@@ -291,13 +359,17 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_spamming:
             await _silent_delete(update, "spam")
             warning_count = add_warning(chat.id, user.id)
-            if warning_count == 1:
-                await context.bot.send_message(chat.id, f"⚠️ *First Warning* for {user.first_name}!\nPlease don't spam.", parse_mode="Markdown")
-            elif warning_count == 2:
-                action_text = "BANNED" if punishment_mode == "ban" else "MUTED"
-                await context.bot.send_message(chat.id, f"⚠️ *Second Warning* for {user.first_name}!\nOne more = {action_text}.", parse_mode="Markdown")
-            elif warning_count >= 3:
-                await apply_punishment("3 Spam Warnings.", "spam")
+            safe_name = html.escape(user.first_name)
+            try:
+                if warning_count == 1:
+                    await context.bot.send_message(chat.id, f"⚠️ <b>First Warning</b> for {safe_name}!\nPlease don't spam.", parse_mode="HTML")
+                elif warning_count == 2:
+                    action_text = "BANNED" if punishment_mode == "ban" else "MUTED"
+                    await context.bot.send_message(chat.id, f"⚠️ <b>Second Warning</b> for {safe_name}!\nOne more = {action_text}.", parse_mode="HTML")
+                elif warning_count >= 3:
+                    await apply_punishment("3 Spam Warnings.", "spam")
+            except Exception as e:
+                logger.error(f"Error sending spam warning: {e}")
             return
 
 
