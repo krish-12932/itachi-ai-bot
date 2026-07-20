@@ -1,6 +1,8 @@
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
+from database.connection import supabase
+
 
 from database.group_models import get_group_settings, init_group_settings, update_group_setting
 
@@ -243,7 +245,16 @@ async def group_settings_callback(update: Update, context: ContextTypes.DEFAULT_
     if setting_type in key_map:
         db_key = key_map[setting_type]
         new_val = not settings.get(db_key, False)
-        update_group_setting(group_id, db_key, new_val)
+        
+        # Mutually exclusive logic for link settings
+        updates = {db_key: new_val}
+        if new_val:
+            if db_key == "anti_link":
+                updates["anti_link_silent"] = False
+            elif db_key == "anti_link_silent":
+                updates["anti_link"] = False
+                
+        supabase.table("group_settings").update(updates).eq("group_id", group_id).execute()
         keyboard = await get_settings_keyboard(group_id)
         await query.edit_message_reply_markup(reply_markup=keyboard)
         
