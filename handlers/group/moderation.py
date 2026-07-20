@@ -15,6 +15,9 @@ logger = logging.getLogger(__name__)
 # Temporary in-memory store for rate limiting: {group_id: {user_id: [timestamp1, timestamp2, ...]}}
 RATE_LIMITS = {}
 
+# In-memory cache for admin status to avoid Telegram API rate limits: {group_id: {user_id: timestamp}}
+ADMIN_CACHE = {}
+
 # Regex for spam/promo detection
 # Catches: http links, t.me invite links, bot username promotions
 LINK_REGEX = re.compile(
@@ -53,11 +56,25 @@ async def check_rate_limit(group_id: int, user_id: int) -> bool:
     return False
 
 async def _is_admin(chat, user_id: int) -> bool:
-    """Helper: returns True if user is creator or admin."""
+    """Helper: returns True if user is creator or admin. Uses 10 min cache to avoid rate limits."""
+    group_id = chat.id
+    now = datetime.now().timestamp()
+
+    # Check cache first (valid for 10 minutes)
+    if group_id in ADMIN_CACHE and user_id in ADMIN_CACHE[group_id]:
+        if now - ADMIN_CACHE[group_id][user_id] < 600:
+            return True
+
     try:
         member = await chat.get_member(user_id)
-        return member.status in ["creator", "administrator"]
-    except Exception:
+        if member.status in ["creator", "administrator"]:
+            if group_id not in ADMIN_CACHE:
+                ADMIN_CACHE[group_id] = {}
+            ADMIN_CACHE[group_id][user_id] = now
+            return True
+        return False
+    except Exception as e:
+        logger.warning(f"Failed to check admin status for {user_id} in {group_id}: {e}")
         return False
 
 async def _silent_delete(update: Update, reason: str):
@@ -291,6 +308,14 @@ async def media_moderate_message(update: Update, context: ContextTypes.DEFAULT_T
 
     chat = update.effective_chat
     user = update.effective_user
+
+    # Don't moderate anonymous admins (they post as the group/channel)
+    if update.message.sender_chat:
+        return
+
+    # Don't moderate if user is None
+    if not user:
+        return
 
     # Don't moderate admins
     if await _is_admin(chat, user.id):
