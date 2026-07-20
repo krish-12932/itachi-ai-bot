@@ -11,7 +11,7 @@ from config import GOOGLE_API_KEYS, OPENROUTER_API_KEY
 from prompts.itachi_prompts import ITACHI_PERSONA_PROMPT
 from database.group_models import get_group_settings, save_group_ai_message
 
-OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+OPENROUTER_MODEL = "google/gemini-2.0-flash-lite-preview-02-05:free"
 
 logger = logging.getLogger(__name__)
 
