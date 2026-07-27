@@ -240,7 +240,7 @@ Classify this message:
     return False
 
 async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Core moderation function called on every group TEXT message"""
+    """Unified moderation function called on ALL group messages except commands."""
     if not update.message or not update.effective_chat or update.effective_chat.type == "private":
         return
         
@@ -303,8 +303,27 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Error muting user: {e}")
 
     # 0. Anti-Forward (Silent Delete — no warning, no ban)
+    # Catches ALL types of forwards (text, voice, audio, photo, poll, contact, etc.)
     if settings.get("anti_forward") and update.message.forward_origin:
         await _silent_delete(update, "forwarded message")
+        return
+
+    # 0.5. Anti-Media (photos, videos, GIFs, stickers, documents, animated emoji)
+    if settings.get("anti_media"):
+        has_media = (
+            update.message.photo or
+            update.message.video or
+            update.message.animation or
+            update.message.sticker or
+            update.message.document or
+            update.message.dice
+        )
+        if has_media:
+            await _silent_delete(update, "media not allowed")
+            return
+
+    # If there is no text/caption to moderate for spam, we can stop here.
+    if not msg_text:
         return
 
     # 1. Anti-Link / Anti-Promotion
@@ -370,48 +389,4 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await apply_punishment("3 Spam Warnings.", "spam")
             except Exception as e:
                 logger.error(f"Error sending spam warning: {e}")
-            return
-
-
-async def media_moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Silent delete handler for photos, videos, GIFs, stickers, documents in groups."""
-    if not update.message or not update.effective_chat or update.effective_chat.type == "private":
-        return
-
-    chat = update.effective_chat
-    user = update.effective_user
-
-    # Don't moderate anonymous admins (they post as the group/channel)
-    if update.message.sender_chat:
-        return
-
-    # Don't moderate if user is None
-    if not user:
-        return
-
-    # Don't moderate admins
-    if await _is_admin(chat, user.id):
-        return
-
-    settings = get_group_settings(chat.id)
-    if not settings:
-        return
-
-    # Anti-Forward check (forwarded media)
-    if settings.get("anti_forward") and update.message.forward_origin:
-        await _silent_delete(update, "forwarded media")
-        return
-
-    # Anti-Media check (photos, videos, GIFs, stickers, documents, animated emoji)
-    if settings.get("anti_media"):
-        has_media = (
-            update.message.photo or
-            update.message.video or
-            update.message.animation or  # GIFs
-            update.message.sticker or
-            update.message.document or
-            update.message.dice  # Animated emojis (🎲⚽🎯 etc.)
-        )
-        if has_media:
-            await _silent_delete(update, "media not allowed")
             return
