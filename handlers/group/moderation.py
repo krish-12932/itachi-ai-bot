@@ -4,7 +4,7 @@ import asyncio
 import html
 from datetime import datetime
 from telegram import Update, ChatPermissions
-from telegram.ext import ContextTypes
+from telegram.ext import ContextTypes, ApplicationHandlerStop
 import aiohttp
 from config import GOOGLE_API_KEYS, OPENROUTER_API_KEY
 from database.group_models import (
@@ -306,7 +306,7 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Catches ALL types of forwards (text, voice, audio, photo, poll, contact, etc.)
     if settings.get("anti_forward") and update.message.forward_origin:
         await _silent_delete(update, "forwarded message")
-        return
+        raise ApplicationHandlerStop()
 
     # 0.5. Anti-Media (photos, videos, GIFs, stickers, documents, animated emoji)
     if settings.get("anti_media"):
@@ -320,7 +320,7 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if has_media:
             await _silent_delete(update, "media not allowed")
-            return
+            raise ApplicationHandlerStop()
 
     # If there is no text/caption to moderate for spam, we can stop here.
     if not msg_text:
@@ -347,7 +347,7 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if settings.get("anti_link_silent"):
             # Silent mode: just delete, no warning
             await _silent_delete(update, "link (silent mode)")
-            return
+            raise ApplicationHandlerStop()
         elif settings.get("anti_link"):
             # Warning mode: delete + warn + punish on 3rd
             await _silent_delete(update, "link")
@@ -363,14 +363,14 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await apply_punishment("3 Warnings for sending Links/Promotions.", "promotion")
             except Exception as e:
                 logger.error(f"Error sending warning: {e}")
-            return
+            raise ApplicationHandlerStop()
 
     # 1.5 AI Promo Detect (separate toggle - silent delete only)
     if settings.get("ai_promo_detect") and not is_promo:
         is_ai_promo = await is_ai_promotion(clean_msg_for_link_check)
         if is_ai_promo:
             await _silent_delete(update, "AI detected promotion")
-            return
+            raise ApplicationHandlerStop()
 
     # 2. Rate Limiting (Anti-Spam Warnings)
     if settings.get("anti_spam"):
@@ -389,4 +389,4 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await apply_punishment("3 Spam Warnings.", "spam")
             except Exception as e:
                 logger.error(f"Error sending spam warning: {e}")
-            return
+            raise ApplicationHandlerStop()
