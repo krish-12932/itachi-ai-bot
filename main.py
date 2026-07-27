@@ -24,7 +24,7 @@ from handlers.imagine import imagine_handler
 
 # Group Moderation & AI Handlers
 from handlers.group.settings import groupsetup_command, group_settings_callback, setwelcome_command
-from handlers.group.moderation import moderate_message, media_moderate_message
+from handlers.group.moderation import moderate_message
 from handlers.group.welcome import group_member_updated, welcome_new_members
 from handlers.group.ai_chat import group_ai_handler, group_message_logger
 from handlers.group.unban_flow import user_unban_command, unbanme_callback
@@ -193,22 +193,19 @@ async def main():
     # Backup: MessageHandler for service messages (invite link joins in older groups)
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members))
     
-    # Group message handlers (moderation FIRST - group=-1, then AI group=1)
-    group_filter = filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND
+    # Group message handlers (moderation FIRST - group=0, then logger/AI)
+    # Logger only wants text, AI only wants text
+    group_text_filter = filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND
     
     # -2: Log all group messages into chat history buffer (silent, no blocking)
-    application.add_handler(MessageHandler(group_filter, group_message_logger), group=-2)
-    # 0: Moderation
-    application.add_handler(MessageHandler(group_filter, moderate_message), group=0)
+    application.add_handler(MessageHandler(group_text_filter, group_message_logger), group=-2)
+    
+    # 0: Unified Moderation (Catch ALL messages except commands to check for media, forwards, and text spam in captions)
+    moderation_filter = filters.ChatType.GROUPS & ~filters.COMMAND
+    application.add_handler(MessageHandler(moderation_filter, moderate_message), group=0)
+    
     # 1: AI responses
-    application.add_handler(MessageHandler(group_filter, group_ai_handler), group=1)
-
-    # Group media moderation (silent delete for photos/videos/GIFs/stickers/documents/animated emoji)
-    group_media_filter = filters.ChatType.GROUPS & (
-        filters.PHOTO | filters.VIDEO | filters.ANIMATION |
-        filters.Sticker.ALL | filters.Document.ALL | filters.Dice.ALL
-    )
-    application.add_handler(MessageHandler(group_media_filter, media_moderate_message), group=0)
+    application.add_handler(MessageHandler(group_text_filter, group_ai_handler), group=1)
     
     # Generic text handler for chat (private)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
