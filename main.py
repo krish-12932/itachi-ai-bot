@@ -18,7 +18,6 @@ from handlers.plan import plan_handler
 from handlers.referral import referral_handler
 from handlers.support import support_handler
 from handlers.admin import broadcast_handler, reply_handler, ban_command_handler, unban_command_handler, give_coins_handler, stats_handler
-from utils.scheduler import setup_scheduler
 from handlers.rewards import daily_handler, leaderboard_handler
 from handlers.imagine import imagine_handler
 
@@ -254,9 +253,6 @@ async def main():
                     )
                 except Exception as e:
                     logger.error(f"Error setting commands for admin {admin_id}: {e}")
-        
-        # Setup Daily Greetings Scheduler
-        setup_scheduler(application)
         
         # Start keep-alive ping task
         asyncio.create_task(keep_alive_ping())
