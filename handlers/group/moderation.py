@@ -247,6 +247,10 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
     msg_text = update.message.text or update.message.caption or ""
+    if update.message.poll:
+        poll = update.message.poll
+        options_text = " ".join([opt.text for opt in poll.options]) if poll.options else ""
+        msg_text = f"{poll.question or ''} {options_text}".strip()
     
     # Don't moderate anonymous admins (they post as the group/channel)
     # When sender_chat is set, the message is from an admin in anonymous mode
@@ -308,7 +312,7 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _silent_delete(update, "forwarded message")
         raise ApplicationHandlerStop()
 
-    # 0.5. Anti-Media (photos, videos, GIFs, stickers, documents, animated emoji)
+    # 0.5. Anti-Media (photos, videos, GIFs, stickers, documents, animated emoji, polls)
     if settings.get("anti_media"):
         has_media = (
             update.message.photo or
@@ -316,7 +320,8 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update.message.animation or
             update.message.sticker or
             update.message.document or
-            update.message.dice
+            update.message.dice or
+            update.message.poll
         )
         if has_media:
             await _silent_delete(update, "media not allowed")
