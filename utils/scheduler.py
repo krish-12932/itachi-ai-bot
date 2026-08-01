@@ -11,6 +11,9 @@ logger = logging.getLogger(__name__)
 # IST Timezone
 IST = pytz.timezone('Asia/Kolkata')
 
+# Tracks the last greeting message sent to each user: {user_id: message_id}
+LAST_GREETING_MSGS = {}
+
 async def send_daily_greeting(context: ContextTypes.DEFAULT_TYPE):
     """Sends personalized greetings to all users based on time of day."""
     job_data = context.job.data
@@ -34,11 +37,22 @@ async def send_daily_greeting(context: ContextTypes.DEFAULT_TYPE):
         name = user.get("first_name", "Shinobi")
         
         try:
-            await context.bot.send_message(
+            # Delete the previous greeting message (Good Morning deleted when Good Afternoon arrives, etc.)
+            prev_msg_id = LAST_GREETING_MSGS.get(user_id)
+            if prev_msg_id:
+                try:
+                    await context.bot.delete_message(chat_id=user_id, message_id=prev_msg_id)
+                except Exception:
+                    pass  # Ignore if already deleted or message not found
+            
+            # Send the new greeting
+            msg = await context.bot.send_message(
                 chat_id=user_id,
                 text=text_template.format(name=name),
                 parse_mode="HTML"
             )
+            # Store message id so the NEXT greeting can delete it
+            LAST_GREETING_MSGS[user_id] = msg.message_id
             success += 1
             # Avoid hitting Telegram limits
             await asyncio.sleep(0.05)
