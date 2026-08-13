@@ -1,397 +1,408 @@
 import logging
-import re
-import asyncio
-import html
-from datetime import datetime
-from telegram import Update, ChatPermissions
-from telegram.ext import ContextTypes, ApplicationHandlerStop
-import aiohttp
-from config import GOOGLE_API_KEYS, OPENROUTER_API_KEY
-from database.group_models import (
-    get_group_settings, add_warning, get_user_warning, reset_warnings, add_ban
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+import telegram.error
+from database.connection import supabase
+from database.group_models import get_group_settings, init_group_settings, update_group_setting, _SETTINGS_CACHE
+import time
 
 logger = logging.getLogger(__name__)
 
-# Temporary in-memory store for rate limiting: {group_id: {user_id: [timestamp1, timestamp2, ...]}}
-RATE_LIMITS = {}
+async def get_info_keyboard(group_id: int):
+    """Page 1: Info/Description page with a button to go to toggles."""
+    kb = [
+        [InlineKeyboardButton("⚙️ Open Toggle Settings →", callback_data=f"gset_page2_{group_id}")],
+        [InlineKeyboardButton("✖️ Close", callback_data="gset_close")]
+    ]
+    return InlineKeyboardMarkup(kb)
 
-# In-memory cache for admin status to avoid Telegram API rate limits: {group_id: {user_id: timestamp}}
-ADMIN_CACHE = {}
-
-# Regex for spam/promo detection
-# Catches: http links, t.me invite links, bot username promotions
-LINK_REGEX = re.compile(
-    r'(https?://[^\s]+|'              # Any http/https URL
-    r't\.me/\+[^\s]+|'               # t.me/+invite_hash (join links)
-    r't\.me/joinchat/[^\s]+|'        # t.me/joinchat/xxx
-    r'@[a-zA-Z0-9_]*_bot\b|'         # @username_bot (underscore style)
-    r'@[a-zA-Z0-9]{4,}bot\b|'        # @usernamebot (no underscore, min 4 chars before bot)
-    r'join\s+my\s+(channel|group)|'  # "join my channel/group"
-    r'subscribe\s+to\b)',             # "subscribe to"
-    re.IGNORECASE
-)
-OPENROUTER_MODEL_MOD = "google/gemini-2.0-flash-lite-preview-02-05:free"
-
-async def check_rate_limit(group_id: int, user_id: int) -> bool:
-    """Returns True if the user is spamming (5 msgs / 10 sec)"""
-    now = datetime.now().timestamp()
-    
-    if group_id not in RATE_LIMITS:
-        RATE_LIMITS[group_id] = {}
-    if user_id not in RATE_LIMITS[group_id]:
-        RATE_LIMITS[group_id][user_id] = []
-        
-    # Add current message timestamp
-    RATE_LIMITS[group_id][user_id].append(now)
-    
-    # Remove timestamps older than 10 seconds
-    RATE_LIMITS[group_id][user_id] = [ts for ts in RATE_LIMITS[group_id][user_id] if now - ts <= 10]
-    
-    # If 5 or more messages in 10 seconds, it's spam
-    if len(RATE_LIMITS[group_id][user_id]) >= 5:
-        # Clear their history so they don't get double-warned immediately
-        RATE_LIMITS[group_id][user_id] = []
-        return True
-        
-    return False
-
-async def _is_admin(chat, user_id: int) -> bool:
-    """Helper: returns True if user is creator or admin. Uses 10 min cache to avoid rate limits."""
-    group_id = chat.id
-    now = datetime.now().timestamp()
-
-    # Check cache first (valid for 10 minutes)
-    if group_id in ADMIN_CACHE and user_id in ADMIN_CACHE[group_id]:
-        if now - ADMIN_CACHE[group_id][user_id] < 600:
-            return True
-
-    try:
-        member = await chat.get_member(user_id)
-        if member.status in ["creator", "administrator"]:
-            if group_id not in ADMIN_CACHE:
-                ADMIN_CACHE[group_id] = {}
-            ADMIN_CACHE[group_id][user_id] = now
-            return True
-        return False
-    except Exception as e:
-        logger.warning(f"Failed to check admin status for {user_id} in {group_id}: {e}")
-        return False
-
-async def _silent_delete(update: Update, reason: str):
-    """Silently delete a message and log it."""
-    try:
-        await update.message.delete()
-        logger.info(f"Silent delete ({reason}): user={update.effective_user.id} in chat={update.effective_chat.id}")
-    except Exception as e:
-        logger.error(f"Failed to delete message ({reason}): {e}")
-
-import json as _json_mod
-import re as _re_mod
-
-# In-memory result cache to avoid repeated AI calls for the same text
-_PROMO_CACHE: dict = {}
-_PROMO_CACHE_MAX = 500
-
-# Quick pre-filter: catch obvious spam patterns WITHOUT an AI call (much faster)
-_QUICK_PROMO_RE = re.compile(
-    r'(earn\s+\d+|per\s+day|daily\s+earn|free\s+money|make\s+money|instant\s+withdraw|'
-    r'join\s+now|click\s+here|dm\s+me|message\s+me|check\s+my\s+(bio|profile|link)|'
-    r'visit\s+my|promote\s+your|advertisement|sponsored|referral\s+code|invite\s+link|'
-    r'airdrop|giveaway|crypto\s+signal|bitcoin|invest\s+now|passive\s+income|work\s+from\s+home)',
-    re.IGNORECASE
-)
-
-def _extract_json_result(reply: str):
-    """Robustly extract JSON even if model wraps in markdown or adds extra text."""
-    reply = reply.strip().strip("`")
-    if reply.lower().startswith("json"):
-        reply = reply[4:].strip()
-    # Try to find a JSON object with regex
-    match = _re_mod.search(r'\{[^}]+\}', reply)
-    if match:
-        try:
-            return _json_mod.loads(match.group().replace("'", '"'))
-        except Exception:
-            pass
-    try:
-        return _json_mod.loads(reply.replace("'", '"'))
-    except Exception:
+async def get_settings_keyboard(group_id: int):
+    settings = get_group_settings(group_id)
+    if not settings:
         return None
 
-async def is_ai_promotion(text: str) -> bool:
-    """Uses AI to detect promotions/spam. OpenRouter primary, Gemini fallback.
-    Features: quick-regex pre-filter, result caching, robust JSON parsing, few-shot prompt."""
+    punishment = settings.get("punishment_mode", "ban")
+    punishment_label = "🔨 Ban" if punishment == "ban" else "🔇 Mute"
+    
+    # Conflict detection: if both Anti-Link modes are ON, show warning
+    link_warn = settings.get("anti_link", False)
+    link_silent = settings.get("anti_link_silent", False)
+    link_warn_label = f"🔗 Anti-Link (Warn): {'✅ ON' if link_warn else '❌ OFF'}{' ⚠️' if link_warn and link_silent else ''}"
+    link_silent_label = f"🔇 Anti-Link (Silent): {'✅ ON' if link_silent else '❌ OFF'}{' ⚠️' if link_warn and link_silent else ''}"
 
-    text = text.strip()
+    topic_on = bool(settings.get("group_topic"))
+    kb = [
+        [InlineKeyboardButton(f"👋 Welcome Msg: {'✅ ON' if settings.get('welcome_enabled', True) else '❌ OFF'}", callback_data=f"gset_welon_{group_id}"),
+         InlineKeyboardButton(f"🗑 Auto-Del: {'✅ ON' if settings.get('auto_delete_welcome') else '❌ OFF'}", callback_data=f"gset_delwel_{group_id}")],
+        [InlineKeyboardButton(f"🛡 Anti-Spam: {'✅ ON' if settings['anti_spam'] else '❌ OFF'}", callback_data=f"gset_spam_{group_id}")],
+        [InlineKeyboardButton(link_warn_label, callback_data=f"gset_link_{group_id}")],
+        [InlineKeyboardButton(link_silent_label, callback_data=f"gset_linksilent_{group_id}")],
+        [InlineKeyboardButton(f"🖼 Anti-Media: {'✅ ON' if settings.get('anti_media') else '❌ OFF'}", callback_data=f"gset_media_{group_id}"),
+         InlineKeyboardButton(f"📨 Anti-Fwd: {'✅ ON' if settings.get('anti_forward') else '❌ OFF'}", callback_data=f"gset_fwd_{group_id}")],
+        [InlineKeyboardButton(f"🤖 AI Help: {'✅ ON' if settings['ai_help'] else '❌ OFF'}", callback_data=f"gset_ai_{group_id}"),
+         InlineKeyboardButton(f"🗣 Proactive AI: {'✅ ON' if settings['proactive_ai'] else '❌ OFF'}", callback_data=f"gset_proai_{group_id}")],
+        [InlineKeyboardButton(f"🧠 AI Context (Topic): {'✅ ON' if topic_on else '❌ OFF'}", callback_data=f"gset_topic_{group_id}"),
+         InlineKeyboardButton(f"🤖 AI Promo Detect: {'✅ ON' if settings.get('ai_promo_detect') else '❌ OFF'}", callback_data=f"gset_promoai_{group_id}")],
+        [InlineKeyboardButton(f"⚖️ Punishment: {punishment_label}", callback_data=f"gset_punish_{group_id}")],
+        [InlineKeyboardButton("← Back to Info", callback_data=f"gset_page1_{group_id}"),
+         InlineKeyboardButton("✖️ Close", callback_data="gset_close")]
+    ]
+    return InlineKeyboardMarkup(kb)
 
-    # 1. Too short to be meaningful spam
-    if len(text) < 20:
-        return False
-
-    # 2. Quick regex pre-filter (no API call needed for obvious patterns)
-    if _QUICK_PROMO_RE.search(text):
-        logger.info(f"Promo quick-detected (regex): {text[:60]}")
-        return True
-
-    # 3. Cache check: skip AI if we've seen this exact message recently
-    cache_key = text.lower()[:200]
-    if cache_key in _PROMO_CACHE:
-        return _PROMO_CACHE[cache_key]
-
-    def _cache(val: bool):
-        if len(_PROMO_CACHE) >= _PROMO_CACHE_MAX:
-            for k in list(_PROMO_CACHE.keys())[:_PROMO_CACHE_MAX // 2]:
-                del _PROMO_CACHE[k]
-        _PROMO_CACHE[cache_key] = val
-        return val
-
-    # 4. AI prompt with few-shot examples for better accuracy
-    prompt = f"""You are a Telegram group spam/promotion detector.
-
-Reply ONLY with raw JSON, no markdown, no explanation:
-{{"is_promotion": true or false, "confidence": 0-100}}
-
-SPAM/PROMOTION (true):
-- "Join my channel for free signals @mychannel"
-- "Earn $500/day,DM me now!"
-- "I will promote your channel cheaply"
-- "Check my bio for the referral link"
-- "Airdrop live! Claim now"
-
-NOT SPAM (false):
-- "What time does the match start?"
-- "I love this song!"
-- "Can anyone help me with Python?"
-- "Bhai kya scene hai aaj?"
-
-Classify this message:
-{text}"""
-
-    # --- PRIMARY: OpenRouter ---
-    if OPENROUTER_API_KEY:
-        try:
-            timeout = aiohttp.ClientTimeout(total=8)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                payload = {
-                    "model": OPENROUTER_MODEL_MOD,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 60,
-                    "temperature": 0.0
-                }
-                headers = {
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://itachi-bot.onrender.com",
-                    "X-Title": "Itachi Moderation"
-                }
-                async with session.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        reply = data["choices"][0]["message"]["content"]
-                        parsed = _extract_json_result(reply)
-                        if parsed is not None:
-                            is_promo = bool(parsed.get("is_promotion")) and parsed.get("confidence", 0) >= 75
-                            return _cache(is_promo)
-                        # Fallback text parse
-                        if "true" in reply.lower() and "false" not in reply.lower():
-                            return _cache(True)
-                        return _cache(False)
-                    else:
-                        body = await resp.text()
-                        logger.warning(f"OpenRouter mod error ({resp.status}): {body[:150]}")
-        except Exception as e:
-            logger.error(f"OpenRouter promo check error: {e}")
-
-    # --- FALLBACK: Gemini Direct API ---
-    if not GOOGLE_API_KEYS:
-        return False
-
-    gemini_payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 60}
-    }
-    try:
-        timeout = aiohttp.ClientTimeout(total=8)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            for api_key in GOOGLE_API_KEYS:
-                for model_name in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-                    try:
-                        async with session.post(url, headers={"Content-Type": "application/json"}, json=gemini_payload) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                if data.get('candidates'):
-                                    reply = data['candidates'][0]['content']['parts'][0]['text']
-                                    parsed = _extract_json_result(reply)
-                                    if parsed is not None:
-                                        is_promo = bool(parsed.get("is_promotion")) and parsed.get("confidence", 0) >= 75
-                                        return _cache(is_promo)
-                                    if "true" in reply.lower() and "false" not in reply.lower():
-                                        return _cache(True)
-                                    return _cache(False)
-                            elif resp.status == 429:
-                                continue
-                    except Exception:
-                        continue
-    except Exception as e:
-        logger.error(f"Gemini promo check error: {e}")
-
-    return False
-
-async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Unified moderation function called on ALL group messages except commands."""
-    if not update.message or not update.effective_chat or update.effective_chat.type == "private":
-        return
-        
+async def groupsetup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
-    msg_text = update.message.text or update.message.caption or ""
-    if update.message.poll:
-        poll = update.message.poll
-        options_text = " ".join([opt.text for opt in poll.options]) if poll.options else ""
-        msg_text = f"{poll.question or ''} {options_text}".strip()
     
-    # Don't moderate anonymous admins (they post as the group/channel)
-    # When sender_chat is set, the message is from an admin in anonymous mode
-    if update.message.sender_chat:
-        return
-    
-    # Don't moderate if user is None (safety check)
-    if not user:
-        return
-    
-    # Don't moderate admins
-    if await _is_admin(chat, user.id):
+    # Must be in private chat
+    if chat.type != "private":
+        await update.message.reply_text("❌ Please use this command in my private chat (DM).")
         return
 
-    settings = get_group_settings(chat.id)
-    if not settings:
-        return # Setup not done yet
-    
-    punishment_mode = settings.get("punishment_mode", "ban")  # 'ban' or 'mute'
-
-    # Helper to apply punishment (Ban or Mute based on settings)
-    async def apply_punishment(reason: str, ban_db_reason: str):
-        if punishment_mode == "ban":
-            try:
-                safe_name = html.escape(user.first_name)
-                await chat.ban_member(user.id)
-                add_ban(chat.id, user.id, ban_db_reason)
-                await context.bot.send_message(
-                    chat.id,
-                    f"🚫 <b>{safe_name} has been Banned!</b>\n\n"
-                    f"📋 Reason: {reason}\n"
-                    f"To unban yourself, message @{context.bot.username} and send:\n"
-                    f"<code>/myunban {chat.id}</code>",
-                    parse_mode="HTML"
-                )
-                reset_warnings(chat.id, user.id)
-            except Exception as e:
-                logger.error(f"Error banning user: {e}")
-        else:  # mute
-            try:
-                safe_name = html.escape(user.first_name)
-                await chat.restrict_member(
-                    user.id,
-                    permissions=ChatPermissions(can_send_messages=False),
-                    until_date=int(datetime.now().timestamp()) + 300  # 5 min mute
-                )
-                await context.bot.send_message(
-                    chat.id,
-                    f"🔇 <b>{safe_name} has been Muted for 5 minutes!</b>\n\n📋 Reason: {reason}",
-                    parse_mode="HTML"
-                )
-                reset_warnings(chat.id, user.id)
-            except Exception as e:
-                logger.error(f"Error muting user: {e}")
-
-    # 0. Anti-Forward (Silent Delete — no warning, no ban)
-    # Catches ALL types of forwards (text, voice, audio, photo, poll, contact, etc.)
-    if settings.get("anti_forward") and update.message.forward_origin:
-        await _silent_delete(update, "forwarded message")
-        raise ApplicationHandlerStop()
-
-    # 0.5. Anti-Media (photos, videos, GIFs, stickers, documents, animated emoji, polls)
-    if settings.get("anti_media"):
-        has_media = (
-            update.message.photo or
-            update.message.video or
-            update.message.animation or
-            update.message.sticker or
-            update.message.document or
-            update.message.dice or
-            update.message.poll
+    # Check for group ID argument
+    if not context.args:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        bot_username = context.bot.username
+        add_url = f"https://t.me/{bot_username}?startgroup=true&admin=change_info+delete_messages+restrict_members+invite_users+pin_messages+manage_video_chats+promote_members+anonymous"
+        
+        keyboard = [[InlineKeyboardButton("➕ Add Bot to your Group", url=add_url)]]
+        
+        await update.message.reply_text(
+            "⚠️ **How to setup a Group:**\n\n"
+            "1. First, add me to your group as an Admin using the button below.\n"
+            "2. Once added, I will automatically set up the group and give you the Settings Menu!\n\n"
+            "_Already added? Use:_ `/groupsetup [GROUP_ID]`",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
         )
-        if has_media:
-            await _silent_delete(update, "media not allowed")
-            raise ApplicationHandlerStop()
-
-    # If there is no text/caption to moderate for spam, we can stop here.
-    if not msg_text:
         return
 
-    # 1. Anti-Link / Anti-Promotion
-    bot_username = context.bot.username or ""
-    group_username = chat.username or ""
+    try:
+        group_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid Group ID.")
+        return
+
+    # Check if user is owner or admin in that group
+    try:
+        member = await context.bot.get_chat_member(chat_id=group_id, user_id=user.id)
+    except Exception:
+        # Sometimes users forget the -100 prefix for supergroups
+        try:
+            group_id = int(f"-100{abs(group_id)}")
+            member = await context.bot.get_chat_member(chat_id=group_id, user_id=user.id)
+        except Exception as e:
+            logger.error(f"Error checking group admin status: {e}")
+            await update.message.reply_text("❌ Could not find that group. Make sure I am added to the group and you entered the correct ID (including the -100 prefix).")
+            return
+
+    try:
+        if member.status not in ["creator", "administrator"]:
+            await update.message.reply_text("❌ You are not an admin of that group.")
+            return
+            
+        group_chat = await context.bot.get_chat(chat_id=group_id)
+        group_title = group_chat.title
+    except Exception as e:
+        logger.error(f"Error fetching group info: {e}")
+        await update.message.reply_text("❌ Could not fetch group info.")
+        return
+
+    # Initialize settings if they don't exist
+    init_group_settings(group_id, user.id)
     
-    # Remove our own bot's @mention AND group's own @username before checking
-    # This prevents false positives when admin tags bot or group username
-    clean_msg_for_link_check = msg_text
-    if bot_username:
-        clean_msg_for_link_check = clean_msg_for_link_check.replace(f"@{bot_username}", "")
-    if group_username:
-        clean_msg_for_link_check = clean_msg_for_link_check.replace(f"@{group_username}", "")
+    # Show PAGE 1: Info page first
+    info_text = f"""⚙️ *Group Setup — {group_title}*
 
-    is_promo = bool(LINK_REGEX.search(clean_msg_for_link_check))
+*📖 What each setting does:*
+――――――――――――――――――――
+👋 *Welcome Msg* — Sends a welcome message to new members.
+🗑 *Auto-Delete Welcome* — Automatically deletes the welcome msg after 2 mins.
+――――――――――――――――――――
+🛡 *Anti-Spam* — 5 messages in 10 sec = warning. 3 warnings = punishment.
+――――――――――――――――――――
+🔗 *Anti-Link (Warn)* — Deletes links/promotions + issues a warning. 3 warnings = punishment.
+🔇 *Anti-Link (Silent)* — Silently deletes links. No warnings, no bans.
+⚠️ _Tip: Do not turn both ON — If Warn is ON, keep Silent OFF._
+――――――――――――――――――――
+🖼 *Anti-Media* — Silently deletes Photos, Videos, GIFs, Stickers, Emojis.
+📨 *Anti-Forward* — Deletes any forwarded messages from other channels/groups.
+――――――――――――――――――――
+🤖 *AI Help* — Itachi replies when tagged or asked a question.
+🗣 *Proactive AI* — Bot randomly speaks up when the group needs help.
+🧠 *AI Context (Topic)* — Set a topic to guide AI responses in your group.
+――――――――――――――――――――
+⚖️ *Punishment* — Choose to Ban or Mute after 3 warnings."""
+
+    info_keyboard = await get_info_keyboard(group_id)
+    await update.message.reply_text(info_text, reply_markup=info_keyboard, parse_mode="Markdown")
+
+async def group_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    user = update.effective_user
+    chat = update.effective_chat
     
-    if not is_promo and (settings.get("anti_link") or settings.get("anti_link_silent")):
-        is_promo = await is_ai_promotion(clean_msg_for_link_check)
+    # We only process if it starts with gset_
+    if not data.startswith("gset_"):
+        return
+        
+    await query.answer()
 
-    if is_promo:
-        if settings.get("anti_link_silent"):
-            # Silent mode: just delete, no warning
-            await _silent_delete(update, "link (silent mode)")
-            raise ApplicationHandlerStop()
-        elif settings.get("anti_link"):
-            # Warning mode: delete + warn + punish on 3rd
-            await _silent_delete(update, "link")
-            warning_count = add_warning(chat.id, user.id)
-            safe_name = html.escape(user.first_name)
+    if data == "gset_close":
+        await query.edit_message_text("⚙️ Setup menu closed.")
+        return
+
+    # Handle Page Navigation
+    if data.startswith("gset_page1_"):
+        group_id = int(data.split("_")[2])
+        # Security check
+        try:
+            member = await context.bot.get_chat_member(chat_id=group_id, user_id=user.id)
+            if member.status not in ["creator", "administrator"]:
+                await query.answer("❌ Only admins can change settings!", show_alert=True)
+                return
+            group_chat = await context.bot.get_chat(chat_id=group_id)
+            group_title = group_chat.title
+        except Exception:
+            await query.answer("❌ Error.", show_alert=True)
+            return
+            
+        info_text = f"""⚙️ *Group Setup — {group_title}*
+
+*📖 What each setting does:*
+――――――――――――――――――――
+👋 *Welcome Msg* — Sends a welcome message to new members.
+🗑 *Auto-Delete Welcome* — Automatically deletes the welcome msg after 2 mins.
+――――――――――――――――――――
+🛡 *Anti-Spam* — 5 messages in 10 sec = warning. 3 warnings = punishment.
+――――――――――――――――――――
+🔗 *Anti-Link (Warn)* — Deletes links/promotions + issues a warning. 3 warnings = punishment.
+🔇 *Anti-Link (Silent)* — Silently deletes links. No warnings, no bans.
+⚠️ _Tip: Do not turn both ON — If Warn is ON, keep Silent OFF._
+――――――――――――――――――――
+🖼 *Anti-Media* — Silently deletes Photos, Videos, GIFs, Stickers, Emojis.
+📨 *Anti-Forward* — Deletes any forwarded messages from other channels/groups.
+――――――――――――――――――――
+🤖 *AI Help* — Itachi replies when tagged or asked a question.
+🗣 *Proactive AI* — Bot randomly speaks up when the group needs help.
+――――――――――――――――――――
+⚖️ *Punishment* — Choose to Ban or Mute after 3 warnings."""
+        info_keyboard = await get_info_keyboard(group_id)
+        await query.edit_message_text(info_text, reply_markup=info_keyboard, parse_mode="Markdown")
+        return
+
+    if data.startswith("gset_page2_"):
+        group_id = int(data.split("_")[2])
+        # Security check
+        try:
+            member = await context.bot.get_chat_member(chat_id=group_id, user_id=user.id)
+            if member.status not in ["creator", "administrator"]:
+                await query.answer("❌ Only admins can change settings!", show_alert=True)
+                return
+        except Exception:
+            await query.answer("❌ Error.", show_alert=True)
+            return
+            
+        keyboard = await get_settings_keyboard(group_id)
+        await query.edit_message_text("⚙️ *Select toggles to enable/disable features:*", reply_markup=keyboard, parse_mode="Markdown")
+        return
+
+    # Extract setting type and group_id
+    # Format: gset_{setting_type}_{group_id}
+    parts = data.split("_")
+    setting_type = parts[1]
+    group_id = int(parts[2])
+    
+    # Security check: only admins can toggle
+    try:
+        member = await context.bot.get_chat_member(chat_id=group_id, user_id=user.id)
+        if member.status not in ["creator", "administrator"]:
+            await query.answer("❌ Only admins of that group can change settings!", show_alert=True)
+            return
+    except Exception as e:
+        logger.error(f"Error checking admin status in callback: {e}")
+        await query.answer("❌ Could not verify your admin status.", show_alert=True)
+        return
+
+    settings = get_group_settings(group_id)
+    if not settings:
+        return
+
+    # Toggle logic for on/off settings
+    key_map = {
+        "spam": "anti_spam",
+        "link": "anti_link",
+        "linksilent": "anti_link_silent",
+        "media": "anti_media",
+        "fwd": "anti_forward",
+        "delwel": "auto_delete_welcome",
+        "welon": "welcome_enabled",
+        "ai": "ai_help",
+        "proai": "proactive_ai",
+        "promoai": "ai_promo_detect"
+    }
+    
+    if setting_type in key_map:
+        db_key = key_map[setting_type]
+        new_val = not settings.get(db_key, False)
+        
+        # Mutually exclusive logic for link settings
+        updates = {db_key: new_val}
+        if new_val:
+            if db_key == "anti_link":
+                updates["anti_link_silent"] = False
+            elif db_key == "anti_link_silent":
+                updates["anti_link"] = False
+                
+        supabase.table("group_settings").update(updates).eq("group_id", group_id).execute()
+        
+        # Update Cache immediately so UI and Moderation are in sync for bulk updates
+        if group_id in _SETTINGS_CACHE:
+            for k, v in updates.items():
+                _SETTINGS_CACHE[group_id]["data"][k] = v
+            _SETTINGS_CACHE[group_id]["timestamp"] = time.time()
+            
+        keyboard = await get_settings_keyboard(group_id)
+        try:
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+        except telegram.error.BadRequest as e:
+            if "Message is not modified" not in str(e):
+                logger.error(f"Error editing markup: {e}")
+        
+    elif setting_type == "topic":
+        from telegram import ForceReply
+        current = settings.get("group_topic")
+        if current:
+            # Turn OFF (clear topic)
+            update_group_setting(group_id, "group_topic", None)
+            await query.answer("🧠 AI Context cleared and disabled.", show_alert=True)
+            keyboard = await get_settings_keyboard(group_id)
             try:
-                if warning_count == 1:
-                    await context.bot.send_message(chat.id, f"⚠️ <b>First Warning</b> for {safe_name}!\nLinks/Promotions are not allowed here.", parse_mode="HTML")
-                elif warning_count == 2:
-                    action_text = "BANNED" if punishment_mode == "ban" else "MUTED"
-                    await context.bot.send_message(chat.id, f"⚠️ <b>Second Warning</b> for {safe_name}!\nOne more link and you will be {action_text}.", parse_mode="HTML")
-                elif warning_count >= 3:
-                    await apply_punishment("3 Warnings for sending Links/Promotions.", "promotion")
-            except Exception as e:
-                logger.error(f"Error sending warning: {e}")
-            raise ApplicationHandlerStop()
+                await query.edit_message_reply_markup(reply_markup=keyboard)
+            except telegram.error.BadRequest:
+                pass
+        else:
+            # Store group_id in user_data for the reply handler
+            context.user_data['pending_topic_group_id'] = group_id
+            logger.info(f"✅ Set pending_topic_group_id={group_id} in user_data for user {user.id}")
+            # Turn ON (prompt for topic) - no parse_mode to keep backticks literal
+            await query.message.reply_text(
+                f"🧠 AI Context Setup\n\nPlease reply to this message with the topic or rules of your group.\n\nExample: This is a community for Naruto fans to discuss anime and manga.\n\nGroup ID: {group_id}",
+                reply_markup=ForceReply(selective=True)
+            )
+            await query.answer("Please reply to the message sent.", show_alert=True)
+    
+    elif setting_type == "punish":
+        # Toggle between ban and mute
+        current = settings.get("punishment_mode", "ban")
+        new_mode = "mute" if current == "ban" else "ban"
+        update_group_setting(group_id, "punishment_mode", new_mode)
+        await query.answer(f"⚖️ Punishment mode changed to {'🔨 Ban' if new_mode == 'ban' else '🔇 Mute'}!", show_alert=True)
+        keyboard = await get_settings_keyboard(group_id)
+        await query.edit_message_reply_markup(reply_markup=keyboard)
 
-    # 1.5 AI Promo Detect (separate toggle - silent delete only)
-    if settings.get("ai_promo_detect") and not is_promo:
-        is_ai_promo = await is_ai_promotion(clean_msg_for_link_check)
-        if is_ai_promo:
-            await _silent_delete(update, "AI detected promotion")
-            raise ApplicationHandlerStop()
+async def handle_topic_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles reply to the AI Context (Topic) prompt - saves topic to database."""
+    logger.info(f"🔄 handle_topic_reply called, text={update.message.text if update.message else 'None'}")
 
-    # 2. Rate Limiting (Anti-Spam Warnings)
-    if settings.get("anti_spam"):
-        is_spamming = await check_rate_limit(chat.id, user.id)
-        if is_spamming:
-            await _silent_delete(update, "spam")
-            warning_count = add_warning(chat.id, user.id)
-            safe_name = html.escape(user.first_name)
-            try:
-                if warning_count == 1:
-                    await context.bot.send_message(chat.id, f"⚠️ <b>First Warning</b> for {safe_name}!\nPlease don't spam.", parse_mode="HTML")
-                elif warning_count == 2:
-                    action_text = "BANNED" if punishment_mode == "ban" else "MUTED"
-                    await context.bot.send_message(chat.id, f"⚠️ <b>Second Warning</b> for {safe_name}!\nOne more = {action_text}.", parse_mode="HTML")
-                elif warning_count >= 3:
-                    await apply_punishment("3 Spam Warnings.", "spam")
-            except Exception as e:
-                logger.error(f"Error sending spam warning: {e}")
-            raise ApplicationHandlerStop()
+    if not update.message or not update.message.reply_to_message:
+        logger.info("❌ No message or no reply_to_message")
+        return
+
+    reply_to = update.message.reply_to_message
+    logger.info(f"✅ reply_to.text={reply_to.text!r}")
+
+    if not reply_to.text:
+        logger.info("❌ reply_to has no text")
+        return
+
+    has_brain = "🧠" in reply_to.text
+    has_context = "AI Context" in reply_to.text
+    logger.info(f"🧠={has_brain}, AI Context={has_context}")
+
+    if not has_brain or not has_context:
+        logger.info("❌ Missing 🧠 or AI Context in reply_to.text")
+        return
+
+    # Get group_id from user_data (stored when toggle was clicked)
+    group_id = context.user_data.pop('pending_topic_group_id', None)
+    logger.info(f"pending_topic_group_id={group_id}")
+    if not group_id:
+        await update.message.reply_text("❌ Session expired. Please run /groupsetup again.")
+        return
+
+    topic_text = update.message.text.strip()
+
+    if not topic_text:
+        await update.message.reply_text("❌ Topic cannot be empty.")
+        return
+
+    update_group_setting(group_id, "group_topic", topic_text)
+
+    await update.message.reply_text(
+        f"✅ **AI Context (Topic) has been set!**\n\n"
+        f"**Topic:** _{topic_text}_\n\n"
+        f"The AI will now use this context when replying in your group.",
+        parse_mode="Markdown"
+    )
+
+
+async def setwelcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    
+    group_id = None
+    new_message = ""
+    
+    if chat.type == "private":
+        if not context.args or len(context.args) < 2:
+            await update.message.reply_text(
+                "❌ **To set the welcome message in private chat:**\n\n"
+                "You must provide the Group ID first.\n"
+                "`/setwelcome -100XXXXX Your custom message here...`\n\n"
+                "_(You can find your Group ID in the settings menu message)_", 
+                parse_mode="Markdown"
+            )
+            return
+            
+        try:
+            group_id = int(context.args[0])
+            new_message = " ".join(context.args[1:])
+        except ValueError:
+            await update.message.reply_text("❌ Invalid Group ID. It must be a number starting with -100.")
+            return
+    else:
+        group_id = chat.id
+        if not context.args:
+            await update.message.reply_text(
+                "⚠️ **How to set a custom welcome message here:**\n\n"
+                "`/setwelcome Welcome to the best group, {name}!`\n\n"
+                "_(You can also do this in my private DM to avoid spamming the group)_",
+                parse_mode="Markdown"
+            )
+            return
+        new_message = " ".join(context.args)
+
+    # Security check: must be admin
+    try:
+        member = await context.bot.get_chat_member(chat_id=group_id, user_id=user.id)
+        if member.status not in ["creator", "administrator"]:
+            await update.message.reply_text("❌ Only group admins can change the welcome message.")
+            return
+    except Exception as e:
+        logger.error(f"Error checking admin status for setwelcome: {e}")
+        await update.message.reply_text("❌ I couldn't verify your admin status. Make sure I am in that group and the ID is correct.")
+        return
+
+    # Update database
+    from database.group_models import init_group_settings
+    init_group_settings(group_id, user.id)
+    
+    update_group_setting(group_id, "welcome_message", new_message)
+    
+    await update.message.reply_text(
+        "✅ **Custom Welcome Message Set!**\n\n"
+        "Here is a preview of how it will look in the group:\n\n"
+        f"👋 Hello Naruto!\n\n{new_message.replace('{name}', 'Naruto')}",
+        parse_mode="Markdown"
+    )
